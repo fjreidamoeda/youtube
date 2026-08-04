@@ -220,7 +220,7 @@ function renderSavedChannels(channels) {
                 <div class="text-sm font-bold text-gray-200 truncate uppercase">${c.name}</div>
                 <div class="text-[10px] text-gray-500 truncate">${c.channel_id}</div>
             </div>
-            <a href="/play_channel/${c.channel_id}" target="_blank" class="bg-dark-600 text-gray-300 px-3 py-1.5 rounded text-xs uppercase tracking-wider border border-dark-600 hover:border-accent">▶ testar</a>
+            <a href="/channel_stream/${c.channel_id}" target="_blank" class="bg-dark-600 text-gray-300 px-3 py-1.5 rounded text-xs uppercase tracking-wider border border-dark-600 hover:border-accent">▶ testar</a>
             <button onclick="removeChannel(${i})" class="bg-red-900/50 text-red-400 px-3 py-1.5 rounded text-xs uppercase tracking-wider border border-red-700 hover:bg-red-900/80">remover</button>
         `;
         savedChannels.appendChild(row);

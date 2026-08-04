@@ -1,14 +1,17 @@
+import asyncio
 import json
 import os
 import re
 import subprocess
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -245,29 +248,72 @@ async def export_m3u(
 
 def resolve_stream_url(video_id: str) -> str:
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
-    try:
-        result = subprocess.run(
-            ["yt-dlp", "-f", "best[protocol=https]/best", "--get-url", yt_url],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            url = result.stdout.strip().split("\n")[0]
-            if url.startswith("http"):
-                return url
-    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        pass
-    try:
-        result = subprocess.run(
-            ["yt-dlp", "-f", "best", "--get-url", yt_url],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            url = result.stdout.strip().split("\n")[0]
-            if url.startswith("http"):
-                return url
-    except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        pass
+    formats = [
+        "best[ext=mp4][acodec!=none][protocol=https]/best",
+        "best",
+    ]
+    for fmt in formats:
+        try:
+            result = subprocess.run(
+                ["yt-dlp", "-f", fmt, "--get-url", "--no-playlist", "--no-warnings", yt_url],
+                capture_output=True, text=True, timeout=45,
+            )
+            if result.returncode == 0:
+                url = result.stdout.strip().split("\n")[0]
+                if url.startswith("http"):
+                    return url
+        except (FileNotFoundError, subprocess.TimeoutExpired, subprocess.CalledProcessError):
+            continue
     return ""
+
+
+async def proxy_from(url: str, request: Request):
+    """Relaya os bytes de uma URL (válida pro IP do VPS) para o player."""
+    headers = {}
+    for h in ("Range", "If-Range", "User-Agent", "Referer"):
+        v = request.headers.get(h)
+        if v:
+            headers[h] = v
+    headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+    client = httpx.AsyncClient(timeout=None)
+    upstream = await client.request("GET", url, headers=headers, follow_redirects=True)
+
+    resp_headers = {}
+    for h in ("content-type", "content-length", "content-range", "accept-ranges", "content-disposition"):
+        v = upstream.headers.get(h)
+        if v:
+            resp_headers[h] = v
+
+    async def gen():
+        try:
+            async for chunk in upstream.aiter_bytes(chunk_size=65536):
+                yield chunk
+        finally:
+            await client.aclose()
+
+    return StreamingResponse(
+        gen(),
+        status_code=upstream.status_code,
+        headers=resp_headers,
+        media_type=None,
+    )
+
+
+def rewrite_hls_manifest(content: str, manifest_url: str, video_id: str) -> str:
+    """Reescreve as URLs de segmentos do m3u8 para passarem pelo proxy do VPS."""
+    lines = []
+    for raw in content.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            lines.append(line)
+        else:
+            abs_url = urllib.parse.urljoin(manifest_url, line)
+            proxied = f"{BASE_URL}/hls/{video_id}?u={urllib.parse.quote(abs_url, safe='')}"
+            lines.append(proxied)
+    return "\n".join(lines)
 
 
 @app.get("/api/export_sql")
@@ -440,6 +486,39 @@ async def play_channel(channel_id: str):
     return await play_video(info["video_id"])
 
 
+@app.get("/stream/{video_id}")
+async def stream_video(video_id: str, request: Request):
+    """Resolve via yt-dlp e TRANSMITE pelo VPS (evita 403 de IP vinculado)."""
+    url = await asyncio.to_thread(resolve_stream_url, video_id)
+    if not url:
+        raise HTTPException(status_code=404, detail="Não foi possível resolver o stream.")
+
+    is_hls = (".m3u8" in url) or ("manifest" in url)
+    if is_hls:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail="Falha ao buscar manifest.")
+            content = rewrite_hls_manifest(r.text, str(r.url), video_id)
+        return Response(content=content, media_type="application/vnd.apple.mpegurl")
+    return await proxy_from(url, request)
+
+
+@app.get("/hls/{video_id}")
+async def hls_segment(video_id: str, request: Request, u: str = Query(...)):
+    """Proxy de segmentos .ts do HLS."""
+    return await proxy_from(u, request)
+
+
+@app.get("/channel_stream/{channel_id}")
+async def channel_stream(channel_id: str, request: Request):
+    """Live se houver; senão último vídeo — transmitido pelo proxy do VPS."""
+    info = get_best_video_id(channel_id)
+    if not info["video_id"]:
+        raise HTTPException(status_code=404, detail="Canal sem vídeo encontrado.")
+    return await stream_video(info["video_id"], request)
+
+
 @app.get("/playlist.m3u8")
 async def playlist_m3u8():
     channels = load_channels()
@@ -448,7 +527,7 @@ async def playlist_m3u8():
         name = c.get("name") or "YouTube"
         logo = c.get("logo") or ""
         tvg_id = c.get("channel_id") or "yt"
-        url = f"{BASE_URL}/play_channel/{c['channel_id']}"
+        url = f"{BASE_URL}/channel_stream/{c['channel_id']}"
         lines.append(
             f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{name}" tvg-logo="{logo}" group-title="YouTube",{name}'
         )
