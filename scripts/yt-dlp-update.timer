@@ -1,0 +1,11 @@
+[Unit]
+Description=YouTube IPTV - Auto-update yt-dlp Timer
+Requires=yt-dlp-update.service
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

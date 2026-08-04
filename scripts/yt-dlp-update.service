@@ -1,0 +1,11 @@
+[Unit]
+Description=YouTube IPTV - Auto-update yt-dlp
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/www/yt-iptv/scripts/update-yt-dlp.sh
+User=root
+
+[Install]
+WantedBy=multi-user.target

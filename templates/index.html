@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube IPTV</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { 900: '#0a0a0f', 800: '#12121a', 700: '#1a1a2e', 600: '#16213e' },
+                        accent: { DEFAULT: '#f97316', 400: '#fb923c', 200: '#fed7aa' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        * { font-family: 'Courier New', monospace; }
+        body { background: #0a0a0f; color: #e2e8f0; }
+        .scanline {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; z-index: 9999;
+            background: repeating-linear-gradient(
+                0deg, transparent, transparent 2px,
+                rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px
+            );
+        }
+        input, button { transition: all 0.2s; }
+        input:focus { outline: none; box-shadow: 0 0 0 2px #f97316; }
+        .channel-card, .video-card {
+            background: #12121a; border: 1px solid #1a1a2e;
+            transition: all 0.2s; cursor: pointer;
+        }
+        .channel-card:hover, .video-card:hover {
+            border-color: #f97316; transform: translateY(-2px);
+        }
+        .channel-card.selected {
+            border-color: #f97316; background: #1a1a2e;
+        }
+        #loader {
+            border: 2px solid #1a1a2e; border-top: 2px solid #f97316;
+            border-radius: 50%; width: 32px; height: 32px;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .btn-accent {
+            background: #f97316; color: #0a0a0f; font-weight: bold;
+            padding: 8px 24px; border: none;
+        }
+        .btn-accent:hover { background: #fb923c; }
+        .btn-accent:disabled { opacity: 0.4; cursor: not-allowed; }
+    </style>
+</head>
+<body class="min-h-screen">
+    <div class="scanline"></div>
+
+    <div class="max-w-6xl mx-auto px-4 py-8">
+        <header class="text-center mb-8">
+            <h1 class="text-3xl font-bold text-accent tracking-wider uppercase mb-2">YouTube IPTV</h1>
+            <p class="text-gray-400 text-sm">Busque canais, veja vídeos, exporte playlist .m3u</p>
+        </header>
+
+        <!-- Search -->
+        <div class="max-w-xl mx-auto mb-8">
+            <div class="flex gap-2">
+                <input type="text" id="searchInput" placeholder="Ex: Sci-Fi, Music, News..."
+                    class="flex-1 bg-dark-700 border border-dark-600 rounded px-4 py-3 text-gray-200 text-sm uppercase placeholder-gray-600">
+                <button id="searchBtn" class="btn-accent rounded uppercase text-sm tracking-wider">Buscar</button>
+            </div>
+            <div class="flex gap-4 mt-3 justify-center text-xs">
+                <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
+                    <input type="radio" name="category" value="CANAIS" checked class="accent-accent">
+                    CANAIS
+                </label>
+                <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
+                    <input type="radio" name="category" value="FILMES" class="accent-accent">
+                    FILMES
+                </label>
+                <label class="flex items-center gap-2 text-gray-400 cursor-pointer">
+                    <input type="radio" name="category" value="SERIES" class="accent-accent">
+                    SÉRIES
+                </label>
+            </div>
+        </div>
+
+        <!-- Error -->
+        <div id="error" class="hidden max-w-xl mx-auto mb-6 bg-red-900/30 border border-red-700 rounded p-3 text-red-400 text-sm text-center"></div>
+
+        <!-- Channels saved (playlist) -->
+        <div class="max-w-3xl mx-auto mb-8 bg-dark-800 border border-dark-600 rounded p-5">
+            <h2 class="text-accent uppercase text-sm tracking-wider mb-3 border-b border-dark-600 pb-2">Canais da playlist</h2>
+            <div class="flex gap-2 mb-3">
+                <input type="text" id="channelInput" placeholder="@canal  |  https://youtube.com/@canal  |  ID do canal"
+                    class="flex-1 bg-dark-700 border border-dark-600 rounded px-4 py-3 text-gray-200 text-sm placeholder-gray-600">
+                <button id="addChannelBtn" class="btn-accent rounded uppercase text-sm tracking-wider">Adicionar</button>
+            </div>
+            <div class="flex items-center gap-2 mb-4">
+                <span class="text-gray-400 text-xs uppercase tracking-wider">Playlist M3U8:</span>
+                <input type="text" id="playlistUrl" readonly
+                    class="flex-1 bg-dark-700 border border-dark-600 rounded px-3 py-2 text-xs text-accent">
+                <button id="copyUrlBtn" class="bg-dark-600 text-gray-300 px-3 py-2 rounded text-xs uppercase tracking-wider border border-dark-600 hover:border-accent">Copiar</button>
+            </div>
+            <div id="savedChannels" class="space-y-2"></div>
+        </div>
+
+        <!-- Channels -->
+        <div id="channelsSection" class="hidden mb-8">
+            <h2 class="text-accent uppercase text-sm tracking-wider mb-4 border-b border-dark-600 pb-2">Canais</h2>
+            <div id="channelsGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4"></div>
+        </div>
+
+        <!-- Videos -->
+        <div id="videosSection" class="hidden mb-8">
+            <div class="flex items-center justify-between mb-4 border-b border-dark-600 pb-2">
+                <h2 class="text-accent uppercase text-sm tracking-wider">Vídeos</h2>
+                <div class="flex gap-2 items-center flex-wrap">
+                    <input type="text" id="streamflowUrl" placeholder="http://SEU_IP:8000"
+                        class="bg-dark-700 border border-dark-600 rounded px-3 py-2 text-xs text-gray-300 w-40 hidden">
+                    <select id="sqlMode" class="bg-dark-700 border border-dark-600 rounded px-2 py-2 text-xs text-gray-300 hidden">
+                        <option value="direct">URL direta (expira)</option>
+                        <option value="proxy">Proxy (precisa servidor)</option>
+                    </select>
+                    <button id="exportSqlBtn" class="bg-dark-600 text-gray-300 px-3 py-2 rounded text-xs uppercase tracking-wider border border-dark-600 hover:border-accent hidden">
+                        SQL
+                    </button>
+                    <button id="exportBtn" class="btn-accent rounded uppercase text-sm tracking-wider hidden">
+                        .m3u
+                    </button>
+                </div>
+            </div>
+            <div id="videosGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4"></div>
+        </div>
+
+        <!-- Loader -->
+        <div id="loader" class="hidden mx-auto"></div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
