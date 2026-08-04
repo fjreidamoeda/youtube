@@ -416,6 +416,7 @@ async def add_channel(request: Request):
     body = await request.json()
     link = (body.get("link") or "").strip()
     name = (body.get("name") or "").strip()
+    category = (body.get("category") or "YouTube").strip()
     if not link:
         raise HTTPException(status_code=400, detail="Cole um link, @canal ou ID do canal.")
 
@@ -446,7 +447,7 @@ async def add_channel(request: Request):
         "channel_id": channel_id,
         "name": name,
         "logo": logo,
-        "group": "YouTube",
+        "group": category,
     }
     channels.append(entry)
     save_channels(channels)
@@ -527,9 +528,10 @@ async def playlist_m3u8():
         name = c.get("name") or "YouTube"
         logo = c.get("logo") or ""
         tvg_id = c.get("channel_id") or "yt"
+        group = c.get("group") or "YouTube"
         url = f"{BASE_URL}/channel_stream/{c['channel_id']}"
         lines.append(
-            f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{name}" tvg-logo="{logo}" group-title="YouTube",{name}'
+            f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{name}" tvg-logo="{logo}" group-title="{group}",{name}'
         )
         lines.append(url)
     content = "\n".join(lines)
