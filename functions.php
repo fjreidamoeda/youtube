@@ -22,10 +22,6 @@ function save_channels(array $channels): bool {
 
 // ------------------------------------------------------------------
 // INTEGRAÇÃO YT-DLP (Prioridade máxima)
-// O yt-dlp é um programa em Python. Ele é baixado sozinho para a
-// pasta bin/ do app, sem precisar de SSH:
-//  1) Se o servidor tem python3  -> baixa o yt-dlp em Python (3,5 MB) e roda via python3
-//  2) Senão                       -> baixa o binário standalone (não precisa de Python)
 // ------------------------------------------------------------------
 
 function ytdlp_python(): ?string {
@@ -74,7 +70,6 @@ function ytdlp_prepare(): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
 
-    // 1) Modo Python: baixa o zipapp puro e confirma que ele REALMENTE roda
     $py = ytdlp_python();
     if ($py) {
         $zipapp = $dir . '/yt-dlp.pyz';
@@ -89,7 +84,6 @@ function ytdlp_prepare(): ?array {
         if (is_file($zipapp) && ytdlp_test_cmd($cand)) return $cand;
     }
 
-    // 2) Fallback: binário standalone (embute o próprio Python, não depende do python3 do servidor)
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
         $bin = $dir . '/yt-dlp.exe';
         $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
@@ -135,9 +129,7 @@ function resolve_via_ytdlp(string $videoId): ?string {
 }
 
 // ------------------------------------------------------------------
-// PROXY: transmite os bytes do stream pelo próprio servidor.
-// Assim o player (ex.: StreamFlow em outro IP) recebe o conteúdo
-// direto daqui, sem levar 403 de assinatura vinculada ao IP.
+// PROXY
 // ------------------------------------------------------------------
 
 function proxy_stream(string $url): void {
@@ -201,6 +193,7 @@ function fetch_url(string $url): array {
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_CONNECTTIMEOUT => 15,
         CURLOPT_TIMEOUT => 40,
@@ -257,16 +250,143 @@ function proxy_hls(string $manifestUrl, string $videoId): void {
     }
 }
 
+function serve_resolved(string $streamUrl, string $videoId): void {
+    if (is_playlist_url($streamUrl)) {
+        proxy_hls_vlc($streamUrl, $videoId);
+    } else {
+        proxy_stream($streamUrl);
+    }
+}
+
+// PROXY HLS PARA IPTV (Xtream/XUI.One) - Manifesto mínimo
+function proxy_hls_iptv(string $manifestUrl, string $videoId): void {
+    $data = fetch_url($manifestUrl);
+    if (empty($data['body']) || ($data['status'] >= 400)) {
+        output_minimal_manifest($videoId, $manifestUrl);
+        return;
+    }
+    
+    header('Content-Type: application/vnd.apple.mpegurl');
+    header('Cache-Control: no-cache');
+    
+    $baseNow = url_base_current();
+    $lines = preg_split('/\r?\n/', $data['body']);
+    $segmentCount = 0;
+    $maxSegments = 5;
+    $lastInf = '';
+    $output = [];
+    
+    $output[] = '#EXTM3U';
+    $output[] = '#EXT-X-VERSION:3';
+    $output[] = '#EXT-X-TARGETDURATION:10';
+    $output[] = '#EXT-X-MEDIA-SEQUENCE:0';
+    $output[] = '#EXT-X-PLAYLIST-TYPE:VOD';
+    
+    foreach ($lines as $line) {
+        $line = rtrim($line);
+        if ($line === '') continue;
+        
+        if (strpos($line, '#EXTINF') === 0) {
+            $lastInf = $line;
+            continue;
+        }
+        
+        if ($line[0] === '#') {
+            continue;
+        }
+        
+        if ($lastInf && $segmentCount < $maxSegments) {
+            $abs = url_join($data['url'], trim($line));
+            $output[] = $lastInf;
+            $output[] = $baseNow . '/stream.php?u=' . rawurlencode($abs);
+            $segmentCount++;
+            $lastInf = '';
+        }
+        
+        if ($segmentCount >= $maxSegments) {
+            $output[] = '#EXT-X-ENDLIST';
+            break;
+        }
+    }
+    
+    if ($segmentCount === 0) {
+        $output[] = '#EXTINF:10.0,';
+        $output[] = $baseNow . '/stream.php?u=' . rawurlencode($manifestUrl) . '&seg=1';
+        $output[] = '#EXTINF:10.0,';
+        $output[] = $baseNow . '/stream.php?u=' . rawurlencode($manifestUrl) . '&seg=2';
+        $output[] = '#EXT-X-ENDLIST';
+    }
+    
+    echo implode("\n", $output);
+}
+
+// PROXY HLS PARA VLC - Manifesto completo com URLs reescritas
+function proxy_hls_vlc(string $manifestUrl, string $videoId): void {
+    $data = fetch_url($manifestUrl);
+    if (empty($data['body']) || ($data['status'] >= 400)) {
+        http_response_code(502);
+        echo "Falha ao buscar manifest HLS.";
+        return;
+    }
+    
+    header('Content-Type: application/vnd.apple.mpegurl');
+    header('Cache-Control: no-cache');
+    
+    $baseNow = url_base_current();
+    $lines = preg_split('/\r?\n/', $data['body']);
+    
+    foreach ($lines as $line) {
+        $line = rtrim($line);
+        if ($line === '') { 
+            echo "\n"; 
+            continue; 
+        }
+        if ($line[0] === '#') {
+            // Reescreve URI="..." (EXT-X-MAP, EXT-X-MEDIA etc.) para passar pelo proxy
+            if (preg_match('~URI="([^"]+)"~', $line, $m)) {
+                $abs = url_join($data['url'], $m[1]);
+                $line = str_replace('URI="' . $m[1] . '"', 'URI="' . $baseNow . '/stream.php?u=' . rawurlencode($abs) . '"', $line);
+            }
+            echo $line . "\n"; 
+            continue; 
+        }
+        if (strpos($line, 'http') !== 0) {
+            $abs = url_join($data['url'], trim($line));
+            echo $baseNow . '/stream.php?u=' . rawurlencode($abs) . "\n";
+        } else {
+            echo $baseNow . '/stream.php?u=' . rawurlencode($line) . "\n";
+        }
+    }
+}
+
+function output_minimal_manifest(string $videoId, string $streamUrl): void {
+    $baseNow = url_base_current();
+    header('Content-Type: application/vnd.apple.mpegurl');
+    header('Cache-Control: no-cache');
+    
+    echo "#EXTM3U\n";
+    echo "#EXT-X-VERSION:3\n";
+    echo "#EXT-X-TARGETDURATION:10\n";
+    echo "#EXT-X-MEDIA-SEQUENCE:0\n";
+    echo "#EXT-X-PLAYLIST-TYPE:VOD\n";
+    
+    for ($i = 0; $i < 3; $i++) {
+        echo "#EXTINF:10.0,\n";
+        echo $baseNow . '/stream.php?u=' . rawurlencode($streamUrl) . "&seg={$i}\n";
+    }
+    echo "#EXT-X-ENDLIST\n";
+}
+
 function url_base_current(): string {
     $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
     return $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
 }
 
 // ------------------------------------------------------------------
-// YOUTUBE API EXTRAS (Grade e M3U)
+// YOUTUBE API EXTRAS
 // ------------------------------------------------------------------
+
 function yt_get_channel_uploads_playlist(string $channelId): string {
-    // A playlist de uploads de um canal substitui o "UC" inicial por "UU"
     if (strpos($channelId, 'UC') === 0) {
         return 'UU' . substr($channelId, 2);
     }
@@ -289,7 +409,7 @@ function get_cached_channel_videos(string $channelId, string $api_key, int $maxR
     
     if (is_file($cacheFile)) {
         $cache = json_decode(@file_get_contents($cacheFile), true);
-        if ($cache && ($now - $cache['time'] < 3600)) { // Cache de 1 hora
+        if ($cache && ($now - $cache['time'] < 3600)) {
             return $cache['data'];
         }
     }
@@ -305,7 +425,7 @@ function get_live_video_id_by_channel_id(string $channelId, string $api_key): ?s
     
     if (is_file($cacheFile)) {
         $cache = json_decode(@file_get_contents($cacheFile), true);
-        if ($cache && ($now - $cache['time'] < 300)) { // Cache de 5 minutos para lives
+        if ($cache && ($now - $cache['time'] < 300)) {
             return $cache['video_id'];
         }
     }
@@ -319,8 +439,9 @@ function get_live_video_id_by_channel_id(string $channelId, string $api_key): ?s
 }
 
 // ------------------------------------------------------------------
-// FUNÇÕES ORIGINAIS OTIMIZADAS
+// FUNÇÕES DE RESOLUÇÃO
 // ------------------------------------------------------------------
+
 function resolve_channel_id(string $input, string $api_key): ?string {
     $input = trim($input);
     if (preg_match('~^UC[0-9A-Za-z_-]{20,}$~', $input)) return $input;
@@ -483,3 +604,28 @@ function resolve_via_invidious(string $videoId): ?string {
     }
     return null;
 }
+
+// DETECTA SE É REQUISIÇÃO IPTV (Xtream/XUI.One)
+function is_iptv_request(): bool {
+    // HEAD request = Xtream/XUI
+    if ($_SERVER['REQUEST_METHOD'] === 'HEAD') {
+        return true;
+    }
+    
+    // Parâmetro XUI forçado
+    if (isset($_GET['xui']) && $_GET['xui'] === '1') {
+        return true;
+    }
+    
+    // User-Agent específico
+    if (isset($_SERVER['HTTP_USER_AGENT'])) {
+        $ua = $_SERVER['HTTP_USER_AGENT'];
+        if (strpos($ua, 'Xtream') !== false || 
+            strpos($ua, 'XUI') !== false) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+?>

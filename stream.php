@@ -1,20 +1,15 @@
 <?php
+// stream.php - Proxy para YouTube HLS
 require_once __DIR__ . '/functions.php';
 ini_set('display_errors', 0);
 header('Access-Control-Allow-Origin: *');
 header('Cache-Control: no-cache');
 
 // Proxy de segmento/manifest HLS: stream.php?u=URL_ENCODED
-// Se a URL apontar para outro manifest (.m3u8), ele é reescrito de novo;
-// se for segmento, os bytes são retransmitidos direto.
 if (isset($_GET['u'])) {
     $u = trim($_GET['u']);
     if (strpos($u, 'http') === 0) {
-        if (is_playlist_url($u)) {
-            proxy_hls($u, 'hls');
-        } else {
-            proxy_stream($u);
-        }
+        serve_resolved($u, '');
         exit;
     }
     http_response_code(400);
@@ -22,21 +17,24 @@ if (isset($_GET['u'])) {
 }
 
 $id = isset($_GET['id']) ? preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['id']) : '';
-if ($id === '') { http_response_code(400); exit('Faltou ?id=VIDEO_ID'); }
+if ($id === '') { 
+    http_response_code(400); 
+    exit('Faltou ?id=VIDEO_ID'); 
+}
 
 $cacheFile = CACHE_DIR . "/yt_video_{$id}.json";
 $now = time();
 
-// Cache rápido de 4 minutos (guarda só a URL resolvida)
+// Cache rápido de 4 minutos
 if (is_file($cacheFile)) {
     $cache = json_decode(@file_get_contents($cacheFile), true);
     if (!empty($cache['url']) && ($now - ($cache['time'] ?? 0) < 240)) {
-        output_stream($cache['url'], $id);
+        serve_resolved($cache['url'], $id);
         exit;
     }
 }
 
-// 1) Prioridade máxima: yt-dlp (binário gerenciado na pasta bin/)
+// 1) Prioridade: yt-dlp
 $streamUrl = resolve_via_ytdlp($id);
 
 // 2) Fallback: Piped e Invidious
@@ -80,17 +78,20 @@ if (!$streamUrl) {
         }
         if (!$streamUrl && isset($data['streamingData']['formats'])) {
             foreach ($data['streamingData']['formats'] as $f) {
-                if (!empty($f['url']) && strpos($f['mimeType'] ?? '', 'video') === 0) { $streamUrl = $f['url']; break; }
+                if (!empty($f['url']) && strpos($f['mimeType'] ?? '', 'video') === 0) { 
+                    $streamUrl = $f['url']; 
+                    break; 
+                }
             }
         }
     }
 }
 
-// 4) Transmite os bytes pelo proxy do próprio servidor (sem redirecionar)
+// 4) Transmite
 if ($streamUrl) {
     $streamUrl = str_replace(['\\u0026', '\\/'], ['&', '/'], $streamUrl);
     @file_put_contents($cacheFile, json_encode(['url' => $streamUrl, 'time' => $now]));
-    output_stream($streamUrl, $id);
+    serve_resolved($streamUrl, $id);
     exit;
 }
 
@@ -99,3 +100,4 @@ http_response_code(503);
 header('Content-Type: text/plain; charset=utf-8');
 echo "Falha ao resolver o stream do video {$id}. Verifique o selftest.php na pasta do app no servidor.";
 exit;
+?>
