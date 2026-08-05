@@ -2,29 +2,48 @@
 require_once __DIR__ . '/functions.php';
 ini_set('display_errors', 0);
 header('Access-Control-Allow-Origin: *');
+header('Cache-Control: no-cache');
+
+// Proxy de segmento/manifest HLS: stream.php?u=URL_ENCODED
+// Se a URL apontar para outro manifest (.m3u8), ele é reescrito de novo;
+// se for segmento, os bytes são retransmitidos direto.
+if (isset($_GET['u'])) {
+    $u = trim($_GET['u']);
+    if (strpos($u, 'http') === 0) {
+        if (is_playlist_url($u)) {
+            proxy_hls($u, 'hls');
+        } else {
+            proxy_stream($u);
+        }
+        exit;
+    }
+    http_response_code(400);
+    exit('Parametro u invalido.');
+}
 
 $id = isset($_GET['id']) ? preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['id']) : '';
 if ($id === '') { http_response_code(400); exit('Faltou ?id=VIDEO_ID'); }
 
-$cacheDir = __DIR__ . '/cache';
-if (!is_dir($cacheDir)) @mkdir($cacheDir, 0775, true);
-$cacheFile = $cacheDir . "/yt_video_{$id}.json";
+$cacheFile = CACHE_DIR . "/yt_video_{$id}.json";
 $now = time();
 
-// Cache 4 min
+// Cache rápido de 4 minutos (guarda só a URL resolvida)
 if (is_file($cacheFile)) {
     $cache = json_decode(@file_get_contents($cacheFile), true);
     if (!empty($cache['url']) && ($now - ($cache['time'] ?? 0) < 240)) {
-        header('Location: ' . $cache['url'], true, 302);
+        output_stream($cache['url'], $id);
         exit;
     }
 }
 
-// 1) Piped (proxy retransmite bytes → assinatura válida) e depois Invidious
-$streamUrl = resolve_via_piped($id);
+// 1) Prioridade máxima: yt-dlp (binário gerenciado na pasta bin/)
+$streamUrl = resolve_via_ytdlp($id);
+
+// 2) Fallback: Piped e Invidious
+if (!$streamUrl) $streamUrl = resolve_via_piped($id);
 if (!$streamUrl) $streamUrl = resolve_via_invidious($id);
 
-// 2) Fallback: YouTube direto (hlsManifestUrl / adaptiveFormats)
+// 3) Fallback: extração direta do HTML do YouTube
 if (!$streamUrl) {
     $watchUrl = "https://www.youtube.com/watch?v={$id}&hl=en";
     $ch = curl_init();
@@ -32,11 +51,11 @@ if (!$streamUrl) {
         CURLOPT_URL => $watchUrl,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_SSL_VERIFYPEER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_TIMEOUT => 8,
         CURLOPT_CONNECTTIMEOUT => 4,
         CURLOPT_HTTPHEADER => [
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
             'Accept-Language: en-US,en;q=0.9',
         ],
     ]);
@@ -67,13 +86,16 @@ if (!$streamUrl) {
     }
 }
 
-// 3) Último recurso: manda pro YouTube (funciona no VLC)
+// 4) Transmite os bytes pelo proxy do próprio servidor (sem redirecionar)
 if ($streamUrl) {
     $streamUrl = str_replace(['\\u0026', '\\/'], ['&', '/'], $streamUrl);
     @file_put_contents($cacheFile, json_encode(['url' => $streamUrl, 'time' => $now]));
-    header('Location: ' . $streamUrl, true, 302);
+    output_stream($streamUrl, $id);
     exit;
 }
 
-header('Location: https://www.youtube.com/watch?v=' . urlencode($id), true, 302);
+// 5) Falhou tudo
+http_response_code(503);
+header('Content-Type: text/plain; charset=utf-8');
+echo "Falha ao resolver o stream do video {$id}. Verifique o selftest.php na pasta do app no servidor.";
 exit;

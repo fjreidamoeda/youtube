@@ -3,6 +3,11 @@
 require_once __DIR__ . '/config.php';
 
 define('DATA_FILE', __DIR__ . '/data.json');
+define('CACHE_DIR', __DIR__ . '/cache');
+
+if (!is_dir(CACHE_DIR)) {
+    @mkdir(CACHE_DIR, 0775, true);
+}
 
 function load_channels(): array {
     if (!is_file(DATA_FILE)) return [];
@@ -15,6 +20,264 @@ function save_channels(array $channels): bool {
     return file_put_contents(DATA_FILE, json_encode($channels, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) !== false;
 }
 
+// ------------------------------------------------------------------
+// INTEGRAÇÃO YT-DLP (Prioridade máxima para VPS)
+// O binário do yt-dlp é baixado sozinho para a pasta bin/ do app,
+// sem precisar de SSH nem de instalar nada no sistema.
+// ------------------------------------------------------------------
+
+function ytdlp_binary_path(): ?string {
+    $dir = __DIR__ . '/bin';
+    if (!is_dir($dir)) @mkdir($dir, 0775, true);
+    $bin = $dir . '/yt-dlp';
+
+    if (is_file($bin) && is_executable($bin)) {
+        if (time() - filemtime($bin) < 3 * 86400) return $bin;
+    }
+
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
+        $bin = $dir . '/yt-dlp.exe';
+    } else {
+        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+    }
+
+    @set_time_limit(180);
+    $ctx = stream_context_create([
+        'http' => ['timeout' => 120, 'header' => "User-Agent: Mozilla/5.0\r\n"],
+        'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false],
+    ]);
+    $data = @file_get_contents($url, false, $ctx);
+    if ($data && strlen($data) > 1000000) {
+        @file_put_contents($bin . '.tmp', $data);
+        @rename($bin . '.tmp', $bin);
+        @chmod($bin, 0755);
+    } else {
+        @unlink($bin . '.tmp');
+    }
+
+    return (is_file($bin) && is_executable($bin)) ? $bin : null;
+}
+
+function ytdlp_build_cmd(string $bin, array $args): string {
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        $parts = ['"' . $bin . '"'];
+        foreach ($args as $a) $parts[] = '"' . str_replace('"', '\\"', $a) . '"';
+        return implode(' ', $parts) . ' 2>nul';
+    }
+    $parts = [escapeshellarg($bin)];
+    foreach ($args as $a) $parts[] = escapeshellarg($a);
+    return implode(' ', $parts) . ' 2>/dev/null';
+}
+
+function resolve_via_ytdlp(string $videoId): ?string {
+    $bin = ytdlp_binary_path();
+    if (!$bin) return null;
+
+    $url = 'https://www.youtube.com/watch?v=' . $videoId;
+    $formats = [
+        'best[ext=mp4][protocol=https]/best[protocol=https]/best',
+        'best',
+    ];
+    foreach ($formats as $fmt) {
+        $cmd = ytdlp_build_cmd($bin, ['-f', $fmt, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates', $url]);
+        exec($cmd, $output, $return_var);
+        $line = trim($output[0] ?? '');
+        $output = [];
+        if ($return_var === 0 && strpos($line, 'http') === 0) {
+            return $line;
+        }
+    }
+    return null;
+}
+
+// ------------------------------------------------------------------
+// PROXY: transmite os bytes do stream pelo próprio servidor.
+// Assim o player (ex.: StreamFlow em outro IP) recebe o conteúdo
+// direto daqui, sem levar 403 de assinatura vinculada ao IP.
+// ------------------------------------------------------------------
+
+function proxy_stream(string $url): void {
+    set_time_limit(0);
+    @ini_set('output_buffering', '0');
+    header('X-Accel-Buffering: no');
+
+    $headers = [];
+    if (!empty($_SERVER['HTTP_RANGE'])) $headers[] = 'Range: ' . $_SERVER['HTTP_RANGE'];
+    $headers[] = 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
+    $headers[] = 'Referer: https://www.youtube.com/';
+    $headers[] = 'Origin: https://www.youtube.com';
+
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => false,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 0,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_WRITEFUNCTION => function ($ch, $data) {
+            echo $data;
+            if (function_exists('ob_flush')) @ob_flush();
+            flush();
+            return strlen($data);
+        },
+        CURLOPT_HEADERFUNCTION => function ($ch, $headerLine) {
+            $trim = trim($headerLine);
+            if (strpos($trim, 'HTTP/') === 0) { header($trim); }
+            else {
+                $parts = explode(':', $trim, 2);
+                if (count($parts) === 2) {
+                    $name = strtolower(trim($parts[0]));
+                    if (in_array($name, ['content-type', 'content-range', 'accept-ranges', 'content-length', 'content-disposition', 'etag'])) {
+                        header($trim);
+                    }
+                }
+            }
+            return strlen($headerLine);
+        },
+    ]);
+    curl_exec($ch);
+    curl_close($ch);
+}
+
+function url_join(string $base, string $rel): string {
+    if ($rel === '' || $rel === null) return $base;
+    if (strpos($rel, '://') !== false) return $rel;
+    $p = parse_url($base);
+    $scheme = $p['scheme'] ?? 'http';
+    $host   = $p['host'] ?? '';
+    $port   = isset($p['port']) ? ':' . $p['port'] : '';
+    if ($rel[0] === '/') return $scheme . '://' . $host . $port . $rel;
+    $path = $p['path'] ?? '/';
+    $dir  = substr($path, 0, strrpos($path, '/') + 1);
+    return $scheme . '://' . $host . $port . $dir . $rel;
+}
+
+function fetch_url(string $url): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_CONNECTTIMEOUT => 15,
+        CURLOPT_TIMEOUT => 40,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_HTTPHEADER => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer: https://www.youtube.com/',
+        ],
+    ]);
+    $resp = curl_exec($ch);
+    $info = curl_getinfo($ch);
+    curl_close($ch);
+    $hs = $info['header_size'] ?? 0;
+    return [
+        'status' => $info['http_code'] ?? 0,
+        'url'    => $info['url'] ?? $url,
+        'body'   => $hs > 0 ? substr($resp, $hs) : $resp,
+    ];
+}
+
+function output_stream(string $url, string $videoId): void {
+    $isHls = (stripos($url, '.m3u8') !== false) || (stripos($url, 'manifest') !== false);
+    if ($isHls) {
+        proxy_hls($url, $videoId);
+    } else {
+        proxy_stream($url);
+    }
+}
+
+function is_playlist_url(string $url): bool {
+    return stripos($url, '.m3u8') !== false
+        || stripos($url, 'manifest') !== false
+        || stripos($url, 'playlist') !== false
+        || stripos($url, 'index.m3u8') !== false;
+}
+
+function proxy_hls(string $manifestUrl, string $videoId): void {
+    $data = fetch_url($manifestUrl);
+    if (empty($data['body']) || ($data['status'] >= 400)) {
+        http_response_code(502);
+        echo "Falha ao buscar manifest HLS (status {$data['status']}).";
+        return;
+    }
+    header('Content-Type: application/vnd.apple.mpegurl');
+    header('Cache-Control: no-cache');
+
+    $baseNow = url_base_current();
+    foreach (preg_split('/\r?\n/', $data['body']) as $line) {
+        $line = rtrim($line);
+        if ($line === '') { echo "\n"; continue; }
+        if ($line[0] === '#') { echo $line . "\n"; continue; }
+        $abs = url_join($data['url'], trim($line));
+        echo $baseNow . '/stream.php?u=' . rawurlencode($abs) . "\n";
+    }
+}
+
+function url_base_current(): string {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    return $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
+}
+
+// ------------------------------------------------------------------
+// YOUTUBE API EXTRAS (Grade e M3U)
+// ------------------------------------------------------------------
+function yt_get_channel_uploads_playlist(string $channelId): string {
+    // A playlist de uploads de um canal substitui o "UC" inicial por "UU"
+    if (strpos($channelId, 'UC') === 0) {
+        return 'UU' . substr($channelId, 2);
+    }
+    return $channelId;
+}
+
+function get_channel_videos_paginated(string $channelId, string $api_key, int $maxResults = 15, string $pageToken = ''): array {
+    $playlistId = yt_get_channel_uploads_playlist($channelId);
+    $url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&playlistId=" . urlencode($playlistId) . "&maxResults=" . (int)$maxResults . "&key=" . urlencode($api_key);
+    
+    if (!empty($pageToken)) {
+        $url .= "&pageToken=" . urlencode($pageToken);
+    }
+    return yt_get_json($url);
+}
+
+function get_cached_channel_videos(string $channelId, string $api_key, int $maxResults = 50): array {
+    $cacheFile = CACHE_DIR . "/videos_{$channelId}.json";
+    $now = time();
+    
+    if (is_file($cacheFile)) {
+        $cache = json_decode(@file_get_contents($cacheFile), true);
+        if ($cache && ($now - $cache['time'] < 3600)) { // Cache de 1 hora
+            return $cache['data'];
+        }
+    }
+    
+    $data = get_channel_videos_paginated($channelId, $api_key, $maxResults);
+    @file_put_contents($cacheFile, json_encode(['time' => $now, 'data' => $data]));
+    return $data;
+}
+
+function get_live_video_id_by_channel_id(string $channelId, string $api_key): ?string {
+    $cacheFile = CACHE_DIR . "/live_{$channelId}.json";
+    $now = time();
+    
+    if (is_file($cacheFile)) {
+        $cache = json_decode(@file_get_contents($cacheFile), true);
+        if ($cache && ($now - $cache['time'] < 300)) { // Cache de 5 minutos para lives
+            return $cache['video_id'];
+        }
+    }
+
+    $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&channelId=" . urlencode($channelId) . "&order=viewCount&maxResults=1&key=" . urlencode($api_key);
+    $data = yt_get_json($url);
+    $videoId = $data['items'][0]['id']['videoId'] ?? null;
+    
+    @file_put_contents($cacheFile, json_encode(['time' => $now, 'video_id' => $videoId]));
+    return $videoId;
+}
+
+// ------------------------------------------------------------------
+// FUNÇÕES ORIGINAIS OTIMIZADAS
+// ------------------------------------------------------------------
 function resolve_channel_id(string $input, string $api_key): ?string {
     $input = trim($input);
     if (preg_match('~^UC[0-9A-Za-z_-]{20,}$~', $input)) return $input;
@@ -24,11 +287,10 @@ function resolve_channel_id(string $input, string $api_key): ?string {
     elseif (preg_match('~youtube\.com/channel/(UC[0-9A-Za-z_-]{20,})~i', $input, $m)) return $m[1];
     elseif (preg_match('~youtube\.com/user/([^/?#]+)~i', $input, $m)) return yt_get_channel_id("forUsername=" . urlencode($m[1]), $api_key);
     elseif (preg_match('~youtube\.com/c/([^/?#]+)~i', $input, $m)) $handle = $m[1];
+    
     if ($handle) {
         $cid = yt_get_channel_id("forHandle=" . urlencode($handle), $api_key);
         if ($cid) return $cid;
-    }
-    if ($handle) {
         $cid = yt_search_channel_id($handle, $api_key);
         if ($cid) return $cid;
     }
@@ -45,12 +307,6 @@ function yt_search_channel_id(string $q, string $api_key): ?string {
     $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&maxResults=1&q=" . urlencode($q) . "&key=" . urlencode($api_key);
     $data = yt_get_json($url);
     return $data['items'][0]['snippet']['channelId'] ?? null;
-}
-
-function get_live_video_id_by_channel_id(string $channelId, string $api_key): ?string {
-    $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&channelId=" . urlencode($channelId) . "&order=viewCount&maxResults=1&key=" . urlencode($api_key);
-    $data = yt_get_json($url);
-    return $data['items'][0]['id']['videoId'] ?? null;
 }
 
 function get_latest_video_id_by_channel_id(string $channelId, string $api_key): ?string {
@@ -78,7 +334,6 @@ function yt_get_json(string $url): array {
     return is_array($json) ? $json : [];
 }
 
-// Extrai o video_id de uma URL do YouTube
 function extract_video_id(?string $url): ?string {
     if (!$url) return null;
     $url = trim($url);
@@ -88,20 +343,16 @@ function extract_video_id(?string $url): ?string {
     return null;
 }
 
-// Resolve um link de canal para video_id OU handle
 function normalize_channel_input($link): ?array {
     $link = trim($link);
     if (!$link) return null;
 
-    // Video ID ou URL de vídeo
     $vid = extract_video_id($link);
     if ($vid) return ['type' => 'video_id', 'value' => $vid];
 
-    // Canal: @handle, /channel/, /user/, /c/, URL do canal
     $cid = resolve_channel_id($link, YT_API_KEY);
     if ($cid) return ['type' => 'channel', 'value' => $cid];
 
-    // Fallback: tenta como handle direto
     $handle = ltrim($link, '@');
     if (preg_match('~^[A-Za-z0-9_\.-]+$~', $handle) && strlen($handle) <= 30) {
         return ['type' => 'handle', 'value' => $handle];
@@ -109,32 +360,23 @@ function normalize_channel_input($link): ?array {
     return null;
 }
 
-// Instâncias Invidious públicas para tentar
 function invidious_instances(): array {
     return [
         'https://inv.nadeko.net',
-        'https://invidious.nerdvpn.de',
         'https://yewtu.be',
-        'https://invidious.privacyredirect.com',
-        'https://iv.melmac.space',
-        'https://invidious.f5.si',
+        'https://invidious.nerdvpn.de',
+        'https://invidious.privacyredirect.com'
     ];
 }
 
-// Instâncias Piped (API) públicas para tentar
 function piped_instances(): array {
     return [
         'https://pipedapi.kavin.rocks',
         'https://api.piped.yt',
-        'https://pipedapi.pfcd.me',
-        'https://pipedapi.leptons.xyz',
-        'https://api.weirish.xyz',
-        'https://pipedapi.lunar.icu',
+        'https://pipedapi.pfcd.me'
     ];
 }
 
-// Resolve via Piped: as URLs já apontam pro proxy do Piped (bytes saem do IP da
-// instância), então a assinatura do YouTube é válida e o VLC reproduz.
 function resolve_via_piped(string $videoId): ?string {
     foreach (piped_instances() as $api) {
         $url = "$api/streams/{$videoId}";
@@ -151,11 +393,8 @@ function resolve_via_piped(string $videoId): ?string {
         curl_close($ch);
         $json = json_decode((string)$resp, true);
         if (!is_array($json) || !empty($json['error'])) continue;
-
-        // Live: usa o manifest HLS (proxy). Ideal pro IPTV.
         if (!empty($json['hls'])) return $json['hls'];
 
-        // Vídeo normal: prefere formato "combinado" (vídeo + áudio juntos).
         $best = null;
         foreach (($json['videoStreams'] ?? []) as $f) {
             if (empty($f['url'])) continue;
@@ -167,7 +406,6 @@ function resolve_via_piped(string $videoId): ?string {
     return null;
 }
 
-// Resolve o stream via Invidious (retorna URL direta ou null)
 function resolve_via_invidious(string $videoId): ?string {
     foreach (invidious_instances() as $inst) {
         $attempts = [
