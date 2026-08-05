@@ -41,23 +41,31 @@ row(
     'Download via PHP (<code>allow_url_fopen</code>): ' . ($auf ? '<b>SIM</b>' : '<b>NÃO</b> &mdash; bloqueia baixar o yt-dlp sozinho.')
 );
 
-// 3) Binário do yt-dlp
-$bin = null;
-if ($canExec && function_exists('ytdlp_binary_path')) {
-    row('info', 'Baixando/verificando o binário do yt-dlp (primeira vez pode levar ~1 min)...');
-    $bin = ytdlp_binary_path();
-    if ($bin) {
-        row('ok', 'Binário yt-dlp: <b>OK</b> em <code>' . htmlspecialchars($bin) . '</code> (' . number_format(filesize($bin) / 1048576, 1) . ' MB)');
-    } else {
-        row('fail', 'Não consegui baixar o binário do yt-dlp. O servidor não está conseguindo acessar github.com (ou a pasta bin/ não tem permissão de escrita).');
-    }
-} elseif (!function_exists('ytdlp_binary_path')) {
-    row('warn', 'functions.php está desatualizado (sem ytdlp_binary_path). Envie a nova versão dos arquivos.');
+// 3) Python + yt-dlp
+$py = null;
+if ($canExec && function_exists('ytdlp_python')) {
+    $py = ytdlp_python();
+    row($py ? 'ok' : 'warn', 'Python 3 no servidor: <b>' . ($py ? 'SIM (' . htmlspecialchars($py) . ')' : 'NÃO &mdash; vou tentar o binário standalone do yt-dlp') . '</b>');
 }
 
-if ($bin) {
+$prep = null;
+if ($canExec && function_exists('ytdlp_prepare')) {
+    row('info', 'Baixando/verificando o yt-dlp (primeira vez pode levar ~1 min)...');
+    $prep = ytdlp_prepare();
+    if ($prep) {
+        $file = ($prep['type'] === 'py') ? $prep['zipapp'] : $prep['binary'];
+        $modo = ($prep['type'] === 'py') ? 'Python (' . htmlspecialchars($prep['python']) . ')' : 'binário standalone';
+        row('ok', 'yt-dlp: <b>OK</b> &mdash; modo <b>' . $modo . '</b> em <code>' . htmlspecialchars($file) . '</code> (' . number_format(filesize($file) / 1048576, 1) . ' MB)');
+    } else {
+        row('fail', 'Não consegui baixar o yt-dlp. O servidor não está conseguindo acessar github.com (ou a pasta bin/ não tem permissão de escrita).');
+    }
+} elseif (!function_exists('ytdlp_prepare')) {
+    row('warn', 'functions.php está desatualizado (sem ytdlp_prepare). Envie a nova versão dos arquivos.');
+}
+
+if ($prep) {
     $out = $last = null;
-    @exec(ytdlp_build_cmd($bin, ['--version']), $out, $last);
+    @exec(ytdlp_build_cmd($prep, ['--version']), $out, $last);
     $ver = trim($out[0] ?? '');
     row($ver ? 'ok' : 'fail', 'Versão do yt-dlp: <b>' . ($ver ? htmlspecialchars($ver) : 'não respondeu') . '</b>');
 

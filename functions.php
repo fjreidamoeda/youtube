@@ -21,58 +21,91 @@ function save_channels(array $channels): bool {
 }
 
 // ------------------------------------------------------------------
-// INTEGRAÇÃO YT-DLP (Prioridade máxima para VPS)
-// O binário do yt-dlp é baixado sozinho para a pasta bin/ do app,
-// sem precisar de SSH nem de instalar nada no sistema.
+// INTEGRAÇÃO YT-DLP (Prioridade máxima)
+// O yt-dlp é um programa em Python. Ele é baixado sozinho para a
+// pasta bin/ do app, sem precisar de SSH:
+//  1) Se o servidor tem python3  -> baixa o yt-dlp em Python (3,5 MB) e roda via python3
+//  2) Senão                       -> baixa o binário standalone (não precisa de Python)
 // ------------------------------------------------------------------
 
-function ytdlp_binary_path(): ?string {
-    $dir = __DIR__ . '/bin';
-    if (!is_dir($dir)) @mkdir($dir, 0775, true);
-    $bin = $dir . '/yt-dlp';
-
-    if (is_file($bin) && is_executable($bin)) {
-        if (time() - filemtime($bin) < 3 * 86400) return $bin;
+function ytdlp_python(): ?string {
+    $out = [];
+    foreach (['python3', 'python'] as $c) {
+        @exec($c . ' -c "import sys" 2>&1', $out, $rc);
+        $out = [];
+        if ($rc === 0) return $c;
     }
-
-    if (strtolower(PHP_OS_FAMILY) === 'windows') {
-        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
-        $bin = $dir . '/yt-dlp.exe';
-    } else {
-        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
-    }
-
-    @set_time_limit(180);
-    $ctx = stream_context_create([
-        'http' => ['timeout' => 120, 'header' => "User-Agent: Mozilla/5.0\r\n"],
-        'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false],
-    ]);
-    $data = @file_get_contents($url, false, $ctx);
-    if ($data && strlen($data) > 1000000) {
-        @file_put_contents($bin . '.tmp', $data);
-        @rename($bin . '.tmp', $bin);
-        @chmod($bin, 0755);
-    } else {
-        @unlink($bin . '.tmp');
-    }
-
-    return (is_file($bin) && is_executable($bin)) ? $bin : null;
+    return null;
 }
 
-function ytdlp_build_cmd(string $bin, array $args): string {
-    if (strtolower(PHP_OS_FAMILY) === 'windows') {
-        $parts = ['"' . $bin . '"'];
-        foreach ($args as $a) $parts[] = '"' . str_replace('"', '\\"', $a) . '"';
-        return implode(' ', $parts) . ' 2>nul';
+function ytdlp_download(string $url): ?string {
+    @set_time_limit(180);
+    $ctx = stream_context_create([
+        'http' => ['timeout' => 120, 'header' => "User-Agent: Mozilla/5.0\r\n", 'follow_location' => 1],
+        'ssl'  => ['verify_peer' => false, 'verify_peer_name' => false],
+    ]);
+    return @file_get_contents($url, false, $ctx);
+}
+
+function ytdlp_prepare(): ?array {
+    $dir = __DIR__ . '/bin';
+    if (!is_dir($dir)) @mkdir($dir, 0775, true);
+
+    // 1) Modo Python (preferido)
+    $py = ytdlp_python();
+    if ($py) {
+        $zipapp = $dir . '/yt-dlp.pyz';
+        if (!is_file($zipapp) || time() - filemtime($zipapp) > 3 * 86400) {
+            $data = ytdlp_download('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp');
+            if ($data && strlen($data) > 500000) {
+                @file_put_contents($zipapp, $data);
+                @chmod($zipapp, 0755);
+            }
+        }
+        if (is_file($zipapp)) return ['type' => 'py', 'python' => $py, 'zipapp' => $zipapp];
     }
-    $parts = [escapeshellarg($bin)];
-    foreach ($args as $a) $parts[] = escapeshellarg($a);
-    return implode(' ', $parts) . ' 2>/dev/null';
+
+    // 2) Binário standalone
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        $bin = $dir . '/yt-dlp.exe';
+        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
+    } else {
+        $bin = $dir . '/yt-dlp-bin';
+        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+    }
+    if (!is_file($bin) || time() - filemtime($bin) > 3 * 86400) {
+        $data = ytdlp_download($url);
+        if ($data && strlen($data) > 1000000) {
+            @file_put_contents($bin . '.tmp', $data);
+            @rename($bin . '.tmp', $bin);
+            @chmod($bin, 0755);
+        } else {
+            @unlink($bin . '.tmp');
+        }
+    }
+    if (is_file($bin) && is_executable($bin)) return ['type' => 'bin', 'binary' => $bin];
+    return null;
+}
+
+function ytdlp_build_cmd(array $prep, array $args): string {
+    $parts = [];
+    if ($prep['type'] === 'py') {
+        $parts[] = $prep['python'];
+        $parts[] = $prep['zipapp'];
+    } else {
+        $parts[] = $prep['binary'];
+    }
+    $parts = array_merge($parts, $args);
+
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        return implode(' ', array_map(function ($p) { return '"' . str_replace('"', '\\"', $p) . '"'; }, $parts)) . ' 2>nul';
+    }
+    return implode(' ', array_map('escapeshellarg', $parts)) . ' 2>/dev/null';
 }
 
 function resolve_via_ytdlp(string $videoId): ?string {
-    $bin = ytdlp_binary_path();
-    if (!$bin) return null;
+    $prep = ytdlp_prepare();
+    if (!$prep) return null;
 
     $url = 'https://www.youtube.com/watch?v=' . $videoId;
     $formats = [
@@ -80,7 +113,7 @@ function resolve_via_ytdlp(string $videoId): ?string {
         'best',
     ];
     foreach ($formats as $fmt) {
-        $cmd = ytdlp_build_cmd($bin, ['-f', $fmt, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates', $url]);
+        $cmd = ytdlp_build_cmd($prep, ['-f', $fmt, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates', $url]);
         exec($cmd, $output, $return_var);
         $line = trim($output[0] ?? '');
         $output = [];
