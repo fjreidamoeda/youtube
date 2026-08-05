@@ -46,18 +46,40 @@ $py = null;
 if ($canExec && function_exists('ytdlp_python')) {
     $py = ytdlp_python();
     row($py ? 'ok' : 'warn', 'Python 3 no servidor: <b>' . ($py ? 'SIM (' . htmlspecialchars($py) . ')' : 'NÃO &mdash; vou tentar o binário standalone do yt-dlp') . '</b>');
+    if ($py) {
+        $out = $last = null;
+        @exec($py . ' --version 2>&1', $out, $last);
+        $ver = trim($out[0] ?? '');
+        row($ver ? 'ok' : 'fail', 'Versão do ' . htmlspecialchars($py) . ': <b>' . ($ver ? htmlspecialchars($ver) : 'não respondeu') . '</b>');
+    }
 }
 
 $prep = null;
 if ($canExec && function_exists('ytdlp_prepare')) {
-    row('info', 'Baixando/verificando o yt-dlp (primeira vez pode levar ~1 min)...');
+    row('info', 'Baixando/verificando o yt-dlp e testando se ele RODA (primeira vez pode levar ~1 min)...');
     $prep = ytdlp_prepare();
     if ($prep) {
         $file = ($prep['type'] === 'py') ? $prep['zipapp'] : $prep['binary'];
         $modo = ($prep['type'] === 'py') ? 'Python (' . htmlspecialchars($prep['python']) . ')' : 'binário standalone';
         row('ok', 'yt-dlp: <b>OK</b> &mdash; modo <b>' . $modo . '</b> em <code>' . htmlspecialchars($file) . '</code> (' . number_format(filesize($file) / 1048576, 1) . ' MB)');
     } else {
-        row('fail', 'Não consegui baixar o yt-dlp. O servidor não está conseguindo acessar github.com (ou a pasta bin/ não tem permissão de escrita).');
+        row('fail', 'Não consegui baixar/rodar o yt-dlp.');
+        $zipapp = __DIR__ . '/bin/yt-dlp.pyz';
+        if (is_file($zipapp)) {
+            $out = $last = null;
+            $pb = ['type' => 'py', 'python' => $py ?: 'python3', 'zipapp' => $zipapp];
+            @exec(ytdlp_build_cmd($pb, ['--version']), $out, $last);
+            $err = implode(' | ', array_slice($out, 0, 4));
+            row('fail', 'Erro ao rodar o yt-dlp Python: <code>' . htmlspecialchars($err ?: '(sem saída)') . '</code>');
+        }
+        $bin = __DIR__ . '/bin/yt-dlp-bin';
+        if (is_file($bin)) {
+            $out = $last = null;
+            $bb = ['type' => 'bin', 'binary' => $bin];
+            @exec(ytdlp_build_cmd($bb, ['--version']), $out, $last);
+            $err = implode(' | ', array_slice($out, 0, 4));
+            row('fail', 'Erro no binário standalone: <code>' . htmlspecialchars($err ?: '(sem saída)') . '</code>');
+        }
     }
 } elseif (!function_exists('ytdlp_prepare')) {
     row('warn', 'functions.php está desatualizado (sem ytdlp_prepare). Envie a nova versão dos arquivos.');

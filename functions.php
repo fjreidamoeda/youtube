@@ -47,11 +47,34 @@ function ytdlp_download(string $url): ?string {
     return @file_get_contents($url, false, $ctx);
 }
 
+function ytdlp_build_cmd(array $prep, array $args): string {
+    $parts = [];
+    if ($prep['type'] === 'py') {
+        $parts[] = $prep['python'];
+        $parts[] = $prep['zipapp'];
+    } else {
+        $parts[] = $prep['binary'];
+    }
+    $parts = array_merge($parts, $args);
+
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        return implode(' ', array_map(function ($p) { return '"' . str_replace('"', '\\"', $p) . '"'; }, $parts)) . ' 2>&1';
+    }
+    return implode(' ', array_map('escapeshellarg', $parts)) . ' 2>&1';
+}
+
+function ytdlp_test_cmd(array $prep): bool {
+    $out = $last = null;
+    @exec(ytdlp_build_cmd($prep, ['--version']), $out, $last);
+    $out = [];
+    return $last === 0;
+}
+
 function ytdlp_prepare(): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
 
-    // 1) Modo Python (preferido)
+    // 1) Modo Python: baixa o zipapp puro e confirma que ele REALMENTE roda
     $py = ytdlp_python();
     if ($py) {
         $zipapp = $dir . '/yt-dlp.pyz';
@@ -62,10 +85,11 @@ function ytdlp_prepare(): ?array {
                 @chmod($zipapp, 0755);
             }
         }
-        if (is_file($zipapp)) return ['type' => 'py', 'python' => $py, 'zipapp' => $zipapp];
+        $cand = ['type' => 'py', 'python' => $py, 'zipapp' => $zipapp];
+        if (is_file($zipapp) && ytdlp_test_cmd($cand)) return $cand;
     }
 
-    // 2) Binário standalone
+    // 2) Fallback: binário standalone (embute o próprio Python, não depende do python3 do servidor)
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
         $bin = $dir . '/yt-dlp.exe';
         $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
@@ -83,24 +107,10 @@ function ytdlp_prepare(): ?array {
             @unlink($bin . '.tmp');
         }
     }
-    if (is_file($bin) && is_executable($bin)) return ['type' => 'bin', 'binary' => $bin];
+    $cand = ['type' => 'bin', 'binary' => $bin];
+    if (is_file($bin) && is_executable($bin) && ytdlp_test_cmd($cand)) return $cand;
+    if (is_file($bin) && is_executable($bin)) return $cand;
     return null;
-}
-
-function ytdlp_build_cmd(array $prep, array $args): string {
-    $parts = [];
-    if ($prep['type'] === 'py') {
-        $parts[] = $prep['python'];
-        $parts[] = $prep['zipapp'];
-    } else {
-        $parts[] = $prep['binary'];
-    }
-    $parts = array_merge($parts, $args);
-
-    if (strtolower(PHP_OS_FAMILY) === 'windows') {
-        return implode(' ', array_map(function ($p) { return '"' . str_replace('"', '\\"', $p) . '"'; }, $parts)) . ' 2>nul';
-    }
-    return implode(' ', array_map('escapeshellarg', $parts)) . ' 2>/dev/null';
 }
 
 function resolve_via_ytdlp(string $videoId): ?string {
