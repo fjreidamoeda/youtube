@@ -34,6 +34,35 @@ function ytdlp_python(): ?string {
     return null;
 }
 
+/**
+ * Procura um binário já existente (colocado manualmente na pasta bin/, ou
+ * instalado no sistema e disponível no PATH) antes de tentar baixar
+ * qualquer coisa da internet.
+ */
+function find_existing_binary(array $names): ?string {
+    $dir = __DIR__ . '/bin';
+    foreach ($names as $n) {
+        $p = $dir . '/' . $n;
+        if (is_file($p) && is_executable($p)) return $p;
+    }
+    
+    $isWindows = strtolower(PHP_OS_FAMILY) === 'windows';
+    foreach ($names as $n) {
+        $out = [];
+        if ($isWindows) {
+            @exec('where ' . escapeshellarg($n) . ' 2>NUL', $out);
+        } else {
+            @exec('command -v ' . escapeshellarg($n) . ' 2>/dev/null', $out);
+        }
+        if (!empty($out[0])) return trim($out[0]);
+    }
+    return null;
+}
+
+function find_ffmpeg(): ?string {
+    return find_existing_binary(['ffmpeg', 'ffmpeg.exe']);
+}
+
 function ytdlp_download(string $url): ?string {
     @set_time_limit(180);
     $ctx = stream_context_create([
@@ -50,6 +79,9 @@ function ytdlp_build_cmd(array $prep, array $args): string {
         $parts[] = $prep['zipapp'];
     } else {
         $parts[] = $prep['binary'];
+    }
+    if (!empty($prep['ffmpeg'])) {
+        $args = array_merge(['--ffmpeg-location', $prep['ffmpeg']], $args);
     }
     $parts = array_merge($parts, $args);
 
@@ -70,6 +102,22 @@ function ytdlp_prepare(): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
 
+    // 0) Usa um yt-dlp já existente (colocado manualmente na pasta bin/, ou
+    // instalado no sistema) antes de tentar baixar qualquer coisa.
+    $existing = find_existing_binary(['yt-dlp', 'yt-dlp-bin', 'yt-dlp.exe', 'yt-dlp.pyz']);
+    if ($existing) {
+        $isZip = substr($existing, -4) === '.pyz';
+        $cand = $isZip
+            ? ['type' => 'py', 'python' => ytdlp_python() ?: 'python3', 'zipapp' => $existing]
+            : ['type' => 'bin', 'binary' => $existing];
+        if (ytdlp_test_cmd($cand)) {
+            log_stream('yt-dlp: usando binário existente em ' . $existing);
+            $cand['ffmpeg'] = find_ffmpeg();
+            return $cand;
+        }
+        log_stream('yt-dlp: binário encontrado em ' . $existing . ' mas falhou no teste --version');
+    }
+
     $py = ytdlp_python();
     if ($py) {
         $zipapp = $dir . '/yt-dlp.pyz';
@@ -81,7 +129,10 @@ function ytdlp_prepare(): ?array {
             }
         }
         $cand = ['type' => 'py', 'python' => $py, 'zipapp' => $zipapp];
-        if (is_file($zipapp) && ytdlp_test_cmd($cand)) return $cand;
+        if (is_file($zipapp) && ytdlp_test_cmd($cand)) {
+            $cand['ffmpeg'] = find_ffmpeg();
+            return $cand;
+        }
     }
 
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
@@ -102,8 +153,14 @@ function ytdlp_prepare(): ?array {
         }
     }
     $cand = ['type' => 'bin', 'binary' => $bin];
-    if (is_file($bin) && is_executable($bin) && ytdlp_test_cmd($cand)) return $cand;
-    if (is_file($bin) && is_executable($bin)) return $cand;
+    if (is_file($bin) && is_executable($bin) && ytdlp_test_cmd($cand)) {
+        $cand['ffmpeg'] = find_ffmpeg();
+        return $cand;
+    }
+    if (is_file($bin) && is_executable($bin)) {
+        $cand['ffmpeg'] = find_ffmpeg();
+        return $cand;
+    }
     return null;
 }
 
@@ -334,6 +391,51 @@ function proxy_hls_vlc(string $manifestUrl, string $videoId): void {
     
     $baseNow = url_base_current();
     $lines = preg_split('/\r?\n/', $data['body']);
+    $isMaster = strpos($data['body'], '#EXT-X-STREAM-INF') !== false;
+    $isLive = !$isMaster && strpos($data['body'], '#EXT-X-ENDLIST') === false;
+    
+    if ($isLive) {
+        // Manifesto ao vivo: entrega só os últimos segmentos (maioria dos apps
+        // de IPTV falha com manifesto gigante de live do YouTube).
+        $keep = 10;
+        $headerLines = [];
+        $segments = [];
+        $pendingInf = '';
+        $baseSeq = 0;
+        
+        foreach ($lines as $line) {
+            $line = rtrim($line);
+            if ($line === '') continue;
+            if (preg_match('/^#EXT-X-MEDIA-SEQUENCE:(\d+)/', $line, $m)) {
+                $baseSeq = (int)$m[1];
+                continue;
+            }
+            if ($line[0] === '#') {
+                if (strpos($line, '#EXTINF') === 0) {
+                    $pendingInf = $line;
+                } elseif ($pendingInf === '' && empty($segments)) {
+                    $headerLines[] = $line;
+                }
+                continue;
+            }
+            if ($pendingInf !== '') {
+                $segments[] = ['inf' => $pendingInf, 'url' => trim($line)];
+                $pendingInf = '';
+            }
+        }
+        
+        $total = count($segments);
+        $startIdx = max(0, $total - $keep);
+        
+        foreach ($headerLines as $h) echo $h . "\n";
+        echo '#EXT-X-MEDIA-SEQUENCE:' . ($baseSeq + $startIdx) . "\n";
+        for ($i = $startIdx; $i < $total; $i++) {
+            $abs = url_join($data['url'], $segments[$i]['url']);
+            echo $segments[$i]['inf'] . "\n";
+            echo $baseNow . '/stream.php?u=' . rawurlencode($abs) . "\n";
+        }
+        return;
+    }
     
     foreach ($lines as $line) {
         $line = rtrim($line);
@@ -400,7 +502,7 @@ function get_channel_videos_paginated(string $channelId, string $api_key, int $m
     if (!empty($pageToken)) {
         $url .= "&pageToken=" . urlencode($pageToken);
     }
-    return yt_get_json($url);
+    return yt_get_json($url, 'playlistItems_' . $channelId);
 }
 
 function get_cached_channel_videos(string $channelId, string $api_key, int $maxResults = 50): array {
@@ -409,33 +511,112 @@ function get_cached_channel_videos(string $channelId, string $api_key, int $maxR
     
     if (is_file($cacheFile)) {
         $cache = json_decode(@file_get_contents($cacheFile), true);
-        if ($cache && ($now - $cache['time'] < 3600)) {
-            return $cache['data'];
+        if ($cache) {
+            $cachedCount = count($cache['data']['items'] ?? []);
+            $age = $now - ($cache['time'] ?? 0);
+            // Cache "cheio": vale por até 1h.
+            if ($cachedCount > 0 && $age < 3600 && ($cachedCount >= $maxResults || $cachedCount >= 50)) {
+                return $cache['data'];
+            }
+            // Cache "vazio" (API falhou/sem vídeos): vale só 5 min, para não
+            // esconder por 1h inteira um problema de chave/quota já corrigido.
+            if ($cachedCount === 0 && $age < 300) {
+                return $cache['data'];
+            }
         }
     }
     
-    $data = get_channel_videos_paginated($channelId, $api_key, $maxResults);
-    @file_put_contents($cacheFile, json_encode(['time' => $now, 'data' => $data]));
-    return $data;
+    // Busca com paginação para atingir até $maxResults vídeos
+    $allItems = [];
+    $pageToken = '';
+    $remaining = $maxResults;
+    $pageInfo = [];
+    
+    while ($remaining > 0) {
+        $perPage = min(50, $remaining); // API aceita no máximo 50 por página
+        $data = get_channel_videos_paginated($channelId, $api_key, $perPage, $pageToken);
+        
+        if (empty($data['items'])) break;
+        
+        $allItems = array_merge($allItems, $data['items']);
+        $remaining -= count($data['items']);
+        $pageInfo = $data['pageInfo'] ?? [];
+        
+        // Se não tem próxima página, para
+        if (empty($data['nextPageToken'])) break;
+        $pageToken = $data['nextPageToken'];
+    }
+    
+    $result = [
+        'items' => array_slice($allItems, 0, $maxResults),
+        'pageInfo' => $pageInfo,
+    ];
+    
+    @file_put_contents($cacheFile, json_encode(['time' => $now, 'data' => $result]));
+    return $result;
 }
 
 function get_live_video_id_by_channel_id(string $channelId, string $api_key): ?string {
     $cacheFile = CACHE_DIR . "/live_{$channelId}.json";
     $now = time();
-    
+
     if (is_file($cacheFile)) {
         $cache = json_decode(@file_get_contents($cacheFile), true);
-        if ($cache && ($now - $cache['time'] < 300)) {
+        if ($cache && ($now - $cache['time'] < 120)) {
             return $cache['video_id'];
         }
     }
 
-    $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&channelId=" . urlencode($channelId) . "&order=viewCount&maxResults=1&key=" . urlencode($api_key);
-    $data = yt_get_json($url);
-    $videoId = $data['items'][0]['id']['videoId'] ?? null;
-    
+    // 1) Checagem gratuita (sem gastar quota): a página /live do canal só
+    //    existe/renderiza um player quando o canal está ao vivo.
+    $videoId = detect_live_via_scrape($channelId);
+
+    // 2) Fallback: YouTube Data API search.list (custa 100 unidades de quota
+    //    por chamada). Só usa se o scrape não confirmou nada, para não
+    //    estourar a quota diária (10.000 unidades no plano gratuito).
+    if (!$videoId) {
+        $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&eventType=live&channelId=" . urlencode($channelId) . "&order=viewCount&maxResults=1&key=" . urlencode($api_key);
+        $data = yt_get_json($url, 'live_search_' . $channelId);
+        $videoId = $data['items'][0]['id']['videoId'] ?? null;
+    }
+
     @file_put_contents($cacheFile, json_encode(['time' => $now, 'video_id' => $videoId]));
     return $videoId;
+}
+
+/**
+ * Verifica se um canal está ao vivo agora sem gastar quota da Data API,
+ * lendo a página pública /live do canal (redireciona para o watch?v= do
+ * vídeo ao vivo quando existe transmissão em andamento).
+ */
+function detect_live_via_scrape(string $channelId): ?string {
+    $url = "https://www.youtube.com/channel/" . rawurlencode($channelId) . "/live";
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => 6,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_HTTPHEADER => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept-Language: en-US,en;q=0.9',
+        ],
+    ]);
+    $html = curl_exec($ch);
+    curl_close($ch);
+    if (!$html) return null;
+
+    // O player só marca isLive/isLiveBroadcast=true quando a transmissão
+    // está realmente ao ar agora.
+    if (strpos($html, '"isLive":true') === false && strpos($html, '"isLiveBroadcast":true') === false) {
+        return null;
+    }
+    if (preg_match('~"videoId":"([A-Za-z0-9_-]{11})"~', $html, $m)) {
+        return $m[1];
+    }
+    return null;
 }
 
 // ------------------------------------------------------------------
@@ -483,7 +664,7 @@ function get_latest_video_id_by_channel_id(string $channelId, string $api_key): 
     return null;
 }
 
-function yt_get_json(string $url): array {
+function yt_get_json(string $url, string $label = ''): array {
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL => $url,
@@ -493,8 +674,21 @@ function yt_get_json(string $url): array {
         CURLOPT_HTTPHEADER => ['User-Agent: Mozilla/5.0', 'Accept: application/json'],
     ]);
     $resp = curl_exec($ch);
+    $curlErr = curl_error($ch);
+    $info = curl_getinfo($ch);
     curl_close($ch);
     $json = json_decode((string)$resp, true);
+
+    // Loga qualquer erro da API do YouTube (chave inválida, quota estourada,
+    // API não habilitada, restrição de referrer/IP etc.) em cache/stream.log,
+    // em vez de simplesmente devolver um array vazio e esconder o motivo real.
+    if (!is_array($json) || isset($json['error'])) {
+        $reason  = $json['error']['errors'][0]['reason'] ?? null;
+        $message = $json['error']['message'] ?? ($curlErr ?: 'resposta inválida/vazia da API');
+        $httpCode = $info['http_code'] ?? 0;
+        log_stream("YT API ERRO" . ($label ? " [{$label}]" : '') . ": HTTP {$httpCode} - {$message}" . ($reason ? " (reason={$reason})" : ''));
+    }
+
     return is_array($json) ? $json : [];
 }
 
@@ -541,15 +735,15 @@ function piped_instances(): array {
     ];
 }
 
-function resolve_via_piped(string $videoId): ?string {
+function resolve_via_piped(string $videoId, int $perInstanceTimeout = 4): ?string {
     foreach (piped_instances() as $api) {
         $url = "$api/streams/{$videoId}";
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 5,
-            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_TIMEOUT => min(4, $perInstanceTimeout),
+            CURLOPT_CONNECTTIMEOUT => 2,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_HTTPHEADER => ['User-Agent: Mozilla/5.0', 'Accept: application/json'],
         ]);
@@ -570,11 +764,11 @@ function resolve_via_piped(string $videoId): ?string {
     return null;
 }
 
-function resolve_via_invidious(string $videoId): ?string {
+function resolve_via_invidious(string $videoId, int $perInstanceTimeout = 4): ?string {
     foreach (invidious_instances() as $inst) {
+        // Só a URL de vídeo formatado direto (mais rápido, um pedido por instância)
         $attempts = [
             "$inst/api/v1/videos/{$videoId}?fields=hlsUrl,formatStreams,adaptiveFormats",
-            "$inst/latest_version?id={$videoId}&itag=18",
         ];
         foreach ($attempts as $url) {
             $ch = curl_init();
@@ -582,8 +776,8 @@ function resolve_via_invidious(string $videoId): ?string {
                 CURLOPT_URL => $url,
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_FOLLOWLOCATION => true,
-                CURLOPT_TIMEOUT => 5,
-                CURLOPT_CONNECTTIMEOUT => 3,
+                CURLOPT_TIMEOUT => min(4, $perInstanceTimeout),
+                CURLOPT_CONNECTTIMEOUT => 2,
                 CURLOPT_SSL_VERIFYPEER => true,
                 CURLOPT_HTTPHEADER => ['User-Agent: Mozilla/5.0'],
             ]);
@@ -605,23 +799,183 @@ function resolve_via_invidious(string $videoId): ?string {
     return null;
 }
 
+// ------------------------------------------------------------------
+// RESOLUÇÃO COM ORÇAMENTO DE TEMPO + CACHE NEGATIVO
+// (evita estourar o timeout de probe do Xtream/XUI e evita repetir
+// a cadeia inteira de fallbacks toda vez que ela falhou há pouco)
+// ------------------------------------------------------------------
+
+function log_stream(string $msg): void {
+    @file_put_contents(CACHE_DIR . '/stream.log', date('Y-m-d H:i:s') . ' - ' . $msg . "\n", FILE_APPEND);
+}
+
+/**
+ * Faz um HEAD real na URL resolvida para descobrir o Content-Type/tamanho
+ * verdadeiros, em vez de adivinhar. Necessário porque vídeos arquivados
+ * (não-live) costumam resolver para MP4/WebM progressivo, não para
+ * segmento MPEG-TS — mandar o Content-Type errado no probe do Xtream faz
+ * o painel rejeitar o canal antes mesmo de tentar reproduzir.
+ */
+function probe_remote_headers(string $url, int $timeout = 5): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_NOBODY => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_HTTPHEADER => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Referer: https://www.youtube.com/',
+        ],
+    ]);
+    $resp = curl_exec($ch);
+    $info = curl_getinfo($ch);
+    curl_close($ch);
+    $headers = [];
+    if ($resp) {
+        foreach (explode("\r\n", $resp) as $line) {
+            if (strpos($line, ':') !== false) {
+                [$k, $v] = explode(':', $line, 2);
+                $headers[strtolower(trim($k))] = trim($v);
+            }
+        }
+    }
+    return ['status' => $info['http_code'] ?? 0, 'headers' => $headers];
+}
+
+/**
+ * Resolve a URL de stream para um videoId, respeitando um orçamento de
+ * tempo total ($budgetSeconds). Usa cache positivo (240s) e cache
+ * negativo (60s) para não martelar provedores externos a cada request.
+ */
+function resolve_stream_url(string $id, int $budgetSeconds = 18): ?string {
+    $cacheFile = CACHE_DIR . "/yt_video_{$id}.json";
+    $negCacheFile = CACHE_DIR . "/yt_video_{$id}_fail.json";
+    $now = time();
+
+    if (is_file($cacheFile)) {
+        $cache = json_decode(@file_get_contents($cacheFile), true);
+        if (!empty($cache['url']) && ($now - ($cache['time'] ?? 0) < 240)) {
+            return $cache['url'];
+        }
+    }
+
+    // Cache negativo: se falhou nos últimos 60s, não tenta de novo agora
+    if (is_file($negCacheFile)) {
+        $neg = json_decode(@file_get_contents($negCacheFile), true);
+        if ($neg && ($now - ($neg['time'] ?? 0) < 60)) {
+            log_stream("id={$id} resolução em cache negativo, pulando");
+            return null;
+        }
+    }
+
+    $deadline = microtime(true) + $budgetSeconds;
+    $streamUrl = null;
+
+    // 1) yt-dlp (mais confiável quando funciona)
+    if (microtime(true) < $deadline) {
+        $streamUrl = resolve_via_ytdlp($id);
+        if ($streamUrl) log_stream("id={$id} resolvido via yt-dlp");
+    }
+
+    // 2) Piped (timeout curto, aborta cedo se estourar o orçamento)
+    if (!$streamUrl && microtime(true) < $deadline) {
+        $streamUrl = resolve_via_piped($id, max(2, (int)($deadline - microtime(true))));
+        if ($streamUrl) log_stream("id={$id} resolvido via piped");
+    }
+
+    // 3) Invidious
+    if (!$streamUrl && microtime(true) < $deadline) {
+        $streamUrl = resolve_via_invidious($id, max(2, (int)($deadline - microtime(true))));
+        if ($streamUrl) log_stream("id={$id} resolvido via invidious");
+    }
+
+    // 4) Scrape direto do HTML do YouTube (último recurso, raramente funciona hoje em dia)
+    if (!$streamUrl && microtime(true) < $deadline) {
+        $streamUrl = resolve_via_html_scrape($id);
+        if ($streamUrl) log_stream("id={$id} resolvido via scrape HTML");
+    }
+
+    if ($streamUrl) {
+        $streamUrl = str_replace(['\\u0026', '\\/'], ['&', '/'], $streamUrl);
+        @file_put_contents($cacheFile, json_encode(['url' => $streamUrl, 'time' => $now]));
+        @unlink($negCacheFile);
+        return $streamUrl;
+    }
+
+    log_stream("id={$id} FALHOU em todos os métodos de resolução");
+    @file_put_contents($negCacheFile, json_encode(['time' => $now]));
+    return null;
+}
+
+function resolve_via_html_scrape(string $id): ?string {
+    $watchUrl = "https://www.youtube.com/watch?v={$id}&hl=en";
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $watchUrl,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => 6,
+        CURLOPT_CONNECTTIMEOUT => 3,
+        CURLOPT_HTTPHEADER => [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept-Language: en-US,en;q=0.9',
+        ],
+    ]);
+    $html = curl_exec($ch);
+    curl_close($ch);
+    if (!preg_match('~ytInitialPlayerResponse\s*=\s*({.+?});~s', (string)$html, $m2)) return null;
+    $data = json_decode($m2[1], true);
+    if (!$data) return null;
+
+    if (isset($data['streamingData']['hlsManifestUrl'])) return $data['streamingData']['hlsManifestUrl'];
+
+    $best = null;
+    foreach (($data['streamingData']['adaptiveFormats'] ?? []) as $f) {
+        if (strpos($f['mimeType'] ?? '', 'video') !== 0 || empty($f['url'])) continue;
+        $h = $f['height'] ?? 0;
+        if (!$best || $h > $best['height']) $best = ['height' => $h, 'url' => $f['url']];
+    }
+    if ($best) return $best['url'];
+
+    foreach (($data['streamingData']['formats'] ?? []) as $f) {
+        if (!empty($f['url']) && strpos($f['mimeType'] ?? '', 'video') === 0) return $f['url'];
+    }
+    return null;
+}
+
 // DETECTA SE É REQUISIÇÃO IPTV (Xtream/XUI.One)
 function is_iptv_request(): bool {
-    // HEAD request = Xtream/XUI
+    // HEAD request = Xtream/XUI probe
     if ($_SERVER['REQUEST_METHOD'] === 'HEAD') {
         return true;
     }
     
-    // Parâmetro XUI forçado
+    // Parâmetro IPTV forçado (adicionado automaticamente pela lista.php)
+    if (isset($_GET['iptv']) && $_GET['iptv'] === '1') {
+        return true;
+    }
+    
+    // Parâmetro XUI forçado (compatibilidade)
     if (isset($_GET['xui']) && $_GET['xui'] === '1') {
         return true;
     }
     
-    // User-Agent específico
+    // User-Agent específico de painéis IPTV
     if (isset($_SERVER['HTTP_USER_AGENT'])) {
-        $ua = $_SERVER['HTTP_USER_AGENT'];
-        if (strpos($ua, 'Xtream') !== false || 
-            strpos($ua, 'XUI') !== false) {
+        $ua = strtolower($_SERVER['HTTP_USER_AGENT']);
+        if (strpos($ua, 'xtream') !== false || 
+            strpos($ua, 'xui') !== false ||
+            strpos($ua, 'stalker') !== false ||
+            strpos($ua, 'ministra') !== false ||
+            strpos($ua, 'mag') !== false ||
+            strpos($ua, 'iptvpro') !== false ||
+            strpos($ua, 'tivimate') !== false ||
+            strpos($ua, 'ott') !== false) {
             return true;
         }
     }
