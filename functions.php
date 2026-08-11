@@ -981,6 +981,12 @@ function is_iptv_request(): bool {
         }
     }
     
+    // URL terminando em .ts (path-info) = pedido de fluxo MPEG-TS
+    $pathInfo = $_SERVER['PATH_INFO'] ?? '';
+    if (preg_match('~\.ts$~i', $pathInfo)) {
+        return true;
+    }
+    
     return false;
 }
 ?>

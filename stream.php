@@ -18,6 +18,15 @@ if (isset($_GET['u'])) {
 }
 
 $id = isset($_GET['id']) ? preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['id']) : '';
+
+// Suporte a URLs estilo IPTV terminando em extensão: /stream.php/VIDEO_ID.ts
+if ($id === '') {
+    $pathInfo = isset($_SERVER['PATH_INFO']) ? trim($_SERVER['PATH_INFO']) : '';
+    if (preg_match('~^/([A-Za-z0-9_-]+)\.(ts|m3u8|mp4)$~', $pathInfo, $m)) {
+        $id = $m[1];
+    }
+}
+
 if ($id === '') {
     http_response_code(400);
     exit('Faltou ?id=VIDEO_ID');

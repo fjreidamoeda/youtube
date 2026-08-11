@@ -11,11 +11,16 @@ if ($download) {
 }
 
 // Modo de saída: iptv (padrão) ou vlc
-// - iptv: adiciona &iptv=1 nas URLs para forçar MPEG-TS via ffmpeg
+// - iptv: URL termina em .ts (formato padrão de listas IPTV: stream.php/VIDEO_ID.ts)
 // - vlc:  URLs normais com HLS reescrito (funciona no VLC)
 // Uso: lista.php?mode=vlc  ou  lista.php?mode=iptv  ou  lista.php (= iptv)
 $mode = $_GET['mode'] ?? 'iptv';
-$iptvSuffix = ($mode === 'vlc') ? '' : '&iptv=1';
+$streamUrl = function (string $id) use ($base, $mode): string {
+    if ($mode === 'vlc') {
+        return $base . '/stream.php?id=' . rawurlencode($id);
+    }
+    return $base . '/stream.php/' . rawurlencode($id) . '.ts';
+};
 
 $channels = load_channels();
 $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
@@ -33,7 +38,7 @@ foreach ($channels as $c) {
 
     if (!empty($c['video_id'])) {
         // Se for apenas um vídeo solto
-        $playUrl = $base . '/stream.php?id=' . rawurlencode($c['video_id']) . $iptvSuffix;
+        $playUrl = $streamUrl($c['video_id']);
         echo '#EXTINF:-1 tvg-id="' . $tvgId . '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="' . $group . '",' . $name . "\n";
         echo '#EXTGRP:' . $group . "\n";
         echo $playUrl . "\n";
@@ -43,7 +48,7 @@ foreach ($channels as $c) {
         // 1. Verifica se está ao vivo primeiro e corta a playlist para colocar a live no topo
         $liveId = get_live_video_id_by_channel_id($channelId, YT_API_KEY);
         if ($liveId) {
-            $liveUrl = $base . '/stream.php?id=' . rawurlencode($liveId) . $iptvSuffix;
+            $liveUrl = $streamUrl($liveId);
             echo '#EXTINF:-1 tvg-id="' . $tvgId . '" tvg-name="[AO VIVO] ' . $name . '" tvg-logo="' . $logo . '" group-title="' . $group . '",[AO VIVO] ' . $name . "\n";
             echo '#EXTGRP:' . $group . "\n";
             echo $liveUrl . "\n";
@@ -67,7 +72,7 @@ foreach ($channels as $c) {
                 
                 $vTitle = $item['snippet']['title'];
                 $vThumb = $item['snippet']['thumbnails']['high']['url'] ?? $logo;
-                $playUrl = $base . '/stream.php?id=' . rawurlencode($vidId) . $iptvSuffix;
+                $playUrl = $streamUrl($vidId);
                 
                 // Remove vírgulas do título para não quebrar a sintaxe do M3U
                 $vTitleClean = str_replace(',', '', $vTitle);
