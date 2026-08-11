@@ -15,16 +15,17 @@ if ($download) {
 // - vlc:  URLs normais com HLS reescrito (funciona no VLC)
 // Uso: lista.php?mode=vlc  ou  lista.php?mode=iptv  ou  lista.php (= iptv)
 $mode = $_GET['mode'] ?? 'iptv';
+
+$channels = load_channels();
+$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+$base = $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
+
 $streamUrl = function (string $id) use ($base, $mode): string {
     if ($mode === 'vlc') {
         return $base . '/stream.php?id=' . rawurlencode($id);
     }
     return $base . '/stream.php/' . rawurlencode($id) . '.ts';
 };
-
-$channels = load_channels();
-$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-$base = $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
 
 echo "#EXTM3U url-tvg=\"{$base}/epg.php\"\n";
 
