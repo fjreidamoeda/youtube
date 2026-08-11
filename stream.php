@@ -32,12 +32,14 @@ if (isset($_GET['u'])) {
 }
 
 $id = isset($_GET['id']) ? preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['id']) : '';
+$ext = '';
 
 // Suporte a URLs estilo IPTV terminando em extensão: /stream.php/VIDEO_ID.ts
 if ($id === '') {
     $pathInfo = isset($_SERVER['PATH_INFO']) ? trim($_SERVER['PATH_INFO']) : '';
     if (preg_match('~^/([A-Za-z0-9_-]+)\.(ts|m3u8|mp4)$~', $pathInfo, $m)) {
         $id = $m[1];
+        $ext = strtolower($m[2]);
     }
 }
 
@@ -49,6 +51,17 @@ if ($id === '') {
 $isHead  = ($_SERVER['REQUEST_METHOD'] === 'HEAD');
 $isIptv  = is_iptv_request();
 $cacheFile = CACHE_DIR . "/yt_video_{$id}.json";
+
+// --- Pedidos .m3u8: entrega HLS ao vivo (apps como IBO pedem m3u8) ---
+if ($ext === 'm3u8') {
+    if ($isHead) {
+        header('Content-Type: application/vnd.apple.mpegurl');
+        http_response_code(200);
+        exit;
+    }
+    serve_live_hls($id);
+    exit;
+}
 
 // --- Resposta rápida para HEAD (probe do Xtream/XUI) ---
 // Painéis Xtream fazem HEAD antes do GET para validar o canal, com timeout

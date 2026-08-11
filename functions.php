@@ -989,4 +989,129 @@ function is_iptv_request(): bool {
     
     return false;
 }
+
+// ------------------------------------------------------------------
+// HLS AO VIVO (para apps que pedem .m3u8, ex.: IBO em modo HLS)
+// Gera segmentos TS com ffmpeg em segundo plano (rolling) e entrega
+// o manifest com URLs absolutas. Os segmentos são servidos como
+// arquivos estáticos em /hls/<id>/ dentro do docroot.
+// ------------------------------------------------------------------
+
+function serve_live_hls(string $id): void {
+    $ffmpeg = find_ffmpeg();
+    if (!$ffmpeg) {
+        http_response_code(503);
+        echo 'Sem ffmpeg para gerar HLS.';
+        return;
+    }
+
+    $source = resolve_stream_url($id, 20);
+    if (!$source) {
+        http_response_code(503);
+        echo "Falha ao resolver o stream do video {$id}.";
+        return;
+    }
+
+    // Fonte já é HLS (YouTube ao vivo) -> proxy do manifest real
+    if (is_playlist_url($source)) {
+        proxy_hls_vlc($source, $id);
+        return;
+    }
+
+    // Fonte progressiva (MP4) -> gera HLS próprio com ffmpeg
+    if (!ensure_hls_ffmpeg($ffmpeg, $id, $source)) {
+        http_response_code(503);
+        echo "Falha ao iniciar gerador HLS para {$id}.";
+        return;
+    }
+
+    $manifest = read_current_manifest($id);
+    if ($manifest === null) {
+        http_response_code(503);
+        echo "Manifest HLS indisponível para {$id}.";
+        return;
+    }
+
+    header('Content-Type: application/vnd.apple.mpegurl');
+    header('Cache-Control: no-cache');
+    header('Access-Control-Allow-Origin: *');
+    echo $manifest;
+}
+
+function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool {
+    $dir = __DIR__ . '/hls/' . $id;
+    if (!is_dir($dir)) @mkdir($dir, 0775, true);
+    $pidFile      = $dir . '/ffmpeg.pid';
+    $manifestFile = $dir . '/index.m3u8';
+
+    // Já tem processo vivo e manifest recente?
+    $pid = is_file($pidFile) ? trim((string)@file_get_contents($pidFile)) : '';
+    if ($pid !== '' && is_numeric($pid)) {
+        $alive = false;
+        if (@is_dir('/proc/' . (int)$pid)) {
+            $alive = true;
+        } else {
+            $o = $rc = null;
+            @exec('kill -0 ' . (int)$pid . ' 2>/dev/null', $o, $rc);
+            $alive = ($rc === 0);
+        }
+        $fresh = is_file($manifestFile) && (time() - @filemtime($manifestFile)) < 30;
+        if ($alive && $fresh) return true;
+    }
+
+    // Mata processo órfão e limpa segmentos antigos
+    if ($pid !== '' && is_numeric($pid)) {
+        @exec('kill -9 ' . (int)$pid . ' 2>/dev/null');
+    }
+    foreach (glob($dir . '/index*.ts') ?: [] as $f) @unlink($f);
+    @unlink($manifestFile);
+
+    $host = $_SERVER['HTTP_HOST'] ?? '45.143.7.108:27021';
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $baseUrl = $scheme . '://' . $host . '/hls/' . $id . '/';
+
+    $cmd = escapeshellarg($ffmpegPath)
+         . ' -y -hide_banner -loglevel error'
+         . ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+         . ' -fflags +genpts'
+         . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
+         . ' -re -stream_loop -1 -i ' . escapeshellarg($source)
+         . ' -c copy -f hls -hls_time 4 -hls_list_size 6 -hls_flags delete_segments'
+         . ' -hls_base_url ' . escapeshellarg($baseUrl)
+         . ' ' . escapeshellarg($dir . '/index.m3u8')
+         . ' > ' . escapeshellarg(CACHE_DIR . '/hls_' . $id . '.log') . ' 2>&1 & echo $!';
+
+    @exec($cmd, $out);
+    $newPid = trim($out[0] ?? '');
+    if ($newPid !== '') @file_put_contents($pidFile, $newPid);
+    log_stream("id={$id} HLS: iniciando gerador de segmentos (pid={$newPid})");
+
+    // Espera o primeiro segmento aparecer (máx. ~15s)
+    for ($i = 0; $i < 30; $i++) {
+        if (is_file($manifestFile) && @filesize($manifestFile) > 0) {
+            $content = (string)@file_get_contents($manifestFile);
+            if (stripos($content, '.ts') !== false) return true;
+        }
+        usleep(500000);
+    }
+    return false;
+}
+
+function read_current_manifest(string $id): ?string {
+    $manifestFile = __DIR__ . '/hls/' . $id . '/index.m3u8';
+    if (!is_file($manifestFile)) return null;
+    $content = (string)@file_get_contents($manifestFile);
+    if (trim($content) === '') return null;
+
+    $host = $_SERVER['HTTP_HOST'] ?? '';
+    $base = '/hls/' . $id . '/';
+    $lines = preg_split('/\r?\n/', $content);
+    foreach ($lines as &$line) {
+        $t = trim($line);
+        if ($t === '' || $t[0] === '#' || preg_match('/^https?:\/\//i', $t)) continue;
+        $line = ($host ? 'http://' . $host : '') . $base . $t;
+    }
+    return implode("\n", $lines);
+}
+
 ?>
