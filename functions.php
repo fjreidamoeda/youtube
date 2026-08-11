@@ -848,8 +848,9 @@ function probe_remote_headers(string $url, int $timeout = 5): array {
 
 /**
  * Resolve a URL de stream para um videoId, respeitando um orçamento de
- * tempo total ($budgetSeconds). Usa cache positivo (240s) e cache
- * negativo (60s) para não martelar provedores externos a cada request.
+ * tempo total ($budgetSeconds). Usa cache positivo (4h, URLs do YouTube
+ * valem ~6h) e cache negativo (60s) para não martelar provedores externos
+ * a cada request.
  */
 function resolve_stream_url(string $id, int $budgetSeconds = 18): ?string {
     $cacheFile = CACHE_DIR . "/yt_video_{$id}.json";
@@ -858,7 +859,7 @@ function resolve_stream_url(string $id, int $budgetSeconds = 18): ?string {
 
     if (is_file($cacheFile)) {
         $cache = json_decode(@file_get_contents($cacheFile), true);
-        if (!empty($cache['url']) && ($now - ($cache['time'] ?? 0) < 240)) {
+        if (!empty($cache['url']) && ($now - ($cache['time'] ?? 0) < 14400)) {
             return $cache['url'];
         }
     }
