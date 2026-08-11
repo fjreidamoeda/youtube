@@ -5,6 +5,11 @@ require_once __DIR__ . '/config.php';
 define('DATA_FILE', __DIR__ . '/data.json');
 define('CACHE_DIR', __DIR__ . '/cache');
 
+// Formato dos segmentos HLS para apps com ExoPlayer (IBO etc.).
+// 'fmp4'  => segmentos CMAF .m4s (corte limpo de áudio, zero CPU, ideal para ExoPlayer)
+// 'mpegts'=> segmentos TS clássicos .ts (compatível com players antigos)
+define('HLS_SEGMENT_TYPE', 'fmp4');
+
 if (!is_dir(CACHE_DIR)) {
     @mkdir(CACHE_DIR, 0775, true);
 }
@@ -1043,10 +1048,32 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
     $pidFile      = $dir . '/ffmpeg.pid';
     $manifestFile = $dir . '/index.m3u8';
+    $cmdFile      = $dir . '/cmd.txt';
 
-    // Já tem processo vivo e manifest recente?
+    $segType = defined('HLS_SEGMENT_TYPE') && in_array(HLS_SEGMENT_TYPE, ['fmp4', 'mpegts'], true)
+        ? HLS_SEGMENT_TYPE : 'fmp4';
+
+    $host = $_SERVER['HTTP_HOST'] ?? '45.143.7.108:27021';
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $baseUrl = $scheme . '://' . $host . '/hls/' . $id . '/';
+
+    $cmd = escapeshellarg($ffmpegPath)
+         . ' -y -hide_banner -loglevel error'
+         . ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+         . ' -fflags +genpts'
+         . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
+         . ' -re -stream_loop -1 -i ' . escapeshellarg($source)
+         . ' -c copy -f hls -hls_time 4 -hls_list_size 6'
+         . ' -hls_segment_type ' . $segType
+         . ' -hls_flags delete_segments+temp_file+independent_segments'
+         . ' -hls_base_url ' . escapeshellarg($baseUrl)
+         . ' ' . escapeshellarg($dir . '/index.m3u8')
+         . ' > ' . escapeshellarg(CACHE_DIR . '/hls_' . $id . '.log') . ' 2>&1 & echo $!';
+
+    // Já tem processo vivo, manifest recente e comando igual ao atual?
     $pid = is_file($pidFile) ? trim((string)@file_get_contents($pidFile)) : '';
-    if ($pid !== '' && is_numeric($pid)) {
+    $cmdStored = is_file($cmdFile) ? trim((string)@file_get_contents($cmdFile)) : '';
+    if ($pid !== '' && is_numeric($pid) && $cmdStored === $cmd) {
         $alive = false;
         if (@is_dir('/proc/' . (int)$pid)) {
             $alive = true;
@@ -1059,38 +1086,26 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
         if ($alive && $fresh) return true;
     }
 
-    // Mata processo órfão e limpa segmentos antigos
+    // Mata processo órfão/antigo (comando diferente) e limpa segmentos
     if ($pid !== '' && is_numeric($pid)) {
         @exec('kill -9 ' . (int)$pid . ' 2>/dev/null');
     }
     foreach (glob($dir . '/index*.ts') ?: [] as $f) @unlink($f);
+    foreach (glob($dir . '/index*.m4s') ?: [] as $f) @unlink($f);
+    @unlink($dir . '/init.mp4');
     @unlink($manifestFile);
-
-    $host = $_SERVER['HTTP_HOST'] ?? '45.143.7.108:27021';
-    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
-    $baseUrl = $scheme . '://' . $host . '/hls/' . $id . '/';
-
-    $cmd = escapeshellarg($ffmpegPath)
-         . ' -y -hide_banner -loglevel error'
-         . ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
-         . ' -fflags +genpts'
-         . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
-         . ' -re -stream_loop -1 -i ' . escapeshellarg($source)
-         . ' -c copy -f hls -hls_time 4 -hls_list_size 6 -hls_flags delete_segments'
-         . ' -hls_base_url ' . escapeshellarg($baseUrl)
-         . ' ' . escapeshellarg($dir . '/index.m3u8')
-         . ' > ' . escapeshellarg(CACHE_DIR . '/hls_' . $id . '.log') . ' 2>&1 & echo $!';
 
     @exec($cmd, $out);
     $newPid = trim($out[0] ?? '');
     if ($newPid !== '') @file_put_contents($pidFile, $newPid);
-    log_stream("id={$id} HLS: iniciando gerador de segmentos (pid={$newPid})");
+    @file_put_contents($cmdFile, $cmd);
+    log_stream("id={$id} HLS: iniciando gerador de segmentos ({$segType}, pid={$newPid})");
 
     // Espera o primeiro segmento aparecer (máx. ~15s)
     for ($i = 0; $i < 30; $i++) {
         if (is_file($manifestFile) && @filesize($manifestFile) > 0) {
             $content = (string)@file_get_contents($manifestFile);
-            if (stripos($content, '.ts') !== false) return true;
+            if (preg_match('/\.(ts|m4s)\b/i', $content)) return true;
         }
         usleep(500000);
     }
