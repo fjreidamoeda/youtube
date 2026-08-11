@@ -5,6 +5,20 @@ ini_set('display_errors', 0);
 header('Access-Control-Allow-Origin: *');
 header('Cache-Control: no-cache');
 
+// --- Log de requisições (diagnóstico: ver o que o app de IPTV realmente pede) ---
+$reqLogFile = CACHE_DIR . '/reqlog.txt';
+if (!is_file($reqLogFile) || @filesize($reqLogFile) < 1024 * 1024) {
+    $reqLine = date('Y-m-d H:i:s') . ' '
+             . $_SERVER['REQUEST_METHOD'] . ' '
+             . ($_SERVER['PATH_INFO'] ?? '') 
+             . ($_SERVER['QUERY_STRING'] ? '?' . substr($_SERVER['QUERY_STRING'], 0, 140) : '')
+             . ' UA=' . substr($_SERVER['HTTP_USER_AGENT'] ?? '', 0, 140)
+             . ' Range=' . substr($_SERVER['HTTP_RANGE'] ?? '', 0, 40)
+             . ' Ref=' . substr($_SERVER['HTTP_REFERER'] ?? '', 0, 60)
+             . "\n";
+    @file_put_contents($reqLogFile, $reqLine, FILE_APPEND);
+}
+
 // Proxy de segmento/manifest HLS: stream.php?u=URL_ENCODED
 if (isset($_GET['u'])) {
     $u = trim($_GET['u']);
