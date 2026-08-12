@@ -35,7 +35,7 @@ foreach ($channels as $c) {
     $logo  = $c['logo'] ?? '';
     
     // Configura o cabeçalho exatamente como pedido
-    $group = "YOUTUBE | " . (function_exists('mb_strtoupper') ? mb_strtoupper($name, 'UTF-8') : strtoupper($name));
+    $group = "CANAIS | " . (function_exists('mb_strtoupper') ? mb_strtoupper($name, 'UTF-8') : strtoupper($name));
 
     if (!empty($c['video_id'])) {
         // Se for apenas um vídeo solto
