@@ -418,6 +418,7 @@ function resolve_via_ytdlp(string $videoId): ?string {
     $formats = [
         'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]',
         'best[format_id!*=sb]',
+        'b',
     ];
     foreach ($formats as $fmt) {
         $cmd = ytdlp_build_cmd($prep, array_merge(
@@ -1488,7 +1489,7 @@ function start_loop_download(string $id, array $prep): void {
     $log = CACHE_DIR . '/loop_' . $id . '.log';
     @unlink(CACHE_DIR . '/loop_' . $id . '.fail');
     $args = [
-        '--no-playlist', '-f', '18/best[ext=mp4][format_id!*=sb]/best[format_id!*=sb]',
+        '--no-playlist', '-f', '18/bestvideo+bestaudio/b',
         '--no-mtime', '--newline', '--no-warnings', '--no-check-certificates',
         '-o', $file,
     ];

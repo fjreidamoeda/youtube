@@ -1,5 +1,5 @@
 <?php
-// test_sel.php — diagnóstico do seletor de formato (vídeos THROTTLED).
+// test_sel.php — diagnóstico do seletor de formato (yt-dlp moderno x antigo).
 // Uso: test_sel.php?id=ID
 require_once __DIR__ . '/functions.php';
 echo '<pre>';
@@ -11,12 +11,23 @@ if (!$v) { echo "Faltou ?id=ID\n</pre>"; exit; }
 $prep = ytdlp_prepare();
 if (!$prep) { echo "SEM YT-DLP FUNCIONAL\n</pre>"; exit; }
 
+echo "== prep em uso ==\n";
+var_export($prep);
+echo "\n\n== versao ==\n";
+$o = null; $rc = null;
+@exec(ytdlp_build_cmd($prep, ['--version']), $o, $rc);
+echo 'rc=' . $rc . ' ' . implode("\n", array_slice($o, 0, 3)) . "\n\n";
+
 function run(array $prep, string $v, array $args): array {
     $cmd = ytdlp_build_cmd($prep, array_merge($args, yt_cookies_args(), ['https://www.youtube.com/watch?v=' . $v]));
     $o = null; $rc = null;
     exec($cmd, $o, $rc);
     return [$rc, $o, $cmd];
 }
+
+echo "== --list-formats ==\n";
+[$rc, $o, $cmd] = run($prep, $v, ['--list-formats', '--no-playlist', '--no-warnings', '--no-check-certificates']);
+echo "rc=$rc\n" . implode("\n", array_slice($o, -20)) . "\n\n";
 
 $sels = [
     ['18', []],
@@ -30,14 +41,10 @@ $sels = [
 
 foreach ($sels as [$s, $extra]) {
     [$rc, $o, $cmd] = run($prep, $v, array_merge($extra, ['-f', $s, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates']));
-    $lines = array_slice($o, 0, 8);
-    echo "### -f '" . $s . "'" . ($extra ? ' ' . implode(' ', $extra) : '') . " => rc=$rc\n";
-    echo implode("\n", $lines) . "\n\n";
+    $line = '';
+    foreach ($o as $l) { $l = trim($l); if (strpos($l, 'http') === 0) { $line = substr($l, 0, 60) . '...'; break; } }
+    if ($line === '') foreach ($o as $l) { $l = trim($l); if (stripos($l, 'ERROR') !== false) { $line = substr($l, 0, 90); break; } }
+    echo "### -f '" . $s . "'" . ($extra ? ' ' . implode(' ', $extra) : '') . " => rc=$rc " . ($line ?: '(sem saida)') . "\n";
     @flush();
 }
-
-// Com -v na cadeia principal, pra ver o motivo real da falha
-[$rc, $o, $cmd] = run($prep, $v, ['-f', 'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]', '--get-url', '-v', '--no-playlist', '--no-warnings', '--no-check-certificates']);
-echo "### cadeia principal com -v => rc=$rc\n";
-echo implode("\n", array_slice($o, -40)) . "\n";
 echo '</pre>';
