@@ -19,18 +19,19 @@ function run(array $prep, string $v, array $args): array {
 }
 
 $sels = [
-    '18',
-    'best',
-    'b',
-    'best[format_id!*=sb]',
-    'best[ext=mp4][protocol=https][format_id!*=sb]',
-    'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]',
+    ['18', []],
+    ['best', []],
+    ['b', []],
+    ['best[format_id!*=sb]', []],
+    ['best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]', []],
+    ['18', ['--extractor-args', 'youtube:player_client=android']],
+    ['18', ['--extractor-args', 'youtube:player_client=web_embedded']],
 ];
 
-foreach ($sels as $s) {
-    [$rc, $o, $cmd] = run($prep, $v, ['-f', $s, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates']);
+foreach ($sels as [$s, $extra]) {
+    [$rc, $o, $cmd] = run($prep, $v, array_merge($extra, ['-f', $s, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates']));
     $lines = array_slice($o, 0, 8);
-    echo "### -f '" . $s . "' => rc=$rc\n";
+    echo "### -f '" . $s . "'" . ($extra ? ' ' . implode(' ', $extra) : '') . " => rc=$rc\n";
     echo implode("\n", $lines) . "\n\n";
     @flush();
 }
