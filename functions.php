@@ -315,18 +315,28 @@ function resolve_via_ytdlp(string $videoId): ?string {
     if (!$prep) return null;
 
     $url = 'https://www.youtube.com/watch?v=' . $videoId;
+    // Exclui formatos "storyboard" (ids tipo sb0/sb1 — grid de thumbnails que o
+    // yt-dlp coloca no topo do "best" e quebra a reprodução). Prefere mp4 com
+    // áudio, depois qualquer formato com áudio, depois qualquer um (sem sb).
     $formats = [
-        'best[ext=mp4][protocol=https]/best[protocol=https]/best',
-        'best',
+        'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]',
+        'best[format_id!*=sb]',
     ];
     foreach ($formats as $fmt) {
         $cmd = ytdlp_build_cmd($prep, ['-f', $fmt, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates', $url]);
         exec($cmd, $output, $return_var);
-        $line = trim($output[0] ?? '');
-        $output = [];
-        if ($return_var === 0 && strpos($line, 'http') === 0) {
-            return $line;
+        if ($return_var === 0) {
+            foreach ($output as $line) {
+                $line = trim($line);
+                // A primeira linha de saída pode ser aviso de deprecação do
+                // Python 3.7; a URL real vem depois. Exige URL de stream de
+                // verdade (googlevideo.com), nunca storyboard/erro.
+                if (strpos($line, 'http') === 0 && strpos($line, 'googlevideo.com') !== false) {
+                    return $line;
+                }
+            }
         }
+        $output = [];
     }
     return null;
 }
@@ -1370,7 +1380,7 @@ function start_loop_download(string $id, array $prep): void {
     $log = CACHE_DIR . '/loop_' . $id . '.log';
     @unlink(CACHE_DIR . '/loop_' . $id . '.fail');
     $args = [
-        '--no-playlist', '-f', '18/best[ext=mp4]/best',
+        '--no-playlist', '-f', '18/best[ext=mp4][format_id!*=sb]/best[format_id!*=sb]',
         '--no-mtime', '--newline', '--no-warnings', '--no-check-certificates',
         '-o', $file,
         'https://www.youtube.com/watch?v=' . $id,
