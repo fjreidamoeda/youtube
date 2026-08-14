@@ -47,6 +47,28 @@ $u = resolve_stream_url($id, 25);
 echo "tempo: " . round(microtime(true) - $t0, 1) . "s\n";
 echo ($u ? 'OK (inicio): ' . substr($u, 0, 140) . "\n" : "FALHOU\n");
 
+echo "\n=== LOOP (arquivo local em cache) ===\n";
+$loopFile = loop_cache_file($id);
+if (is_file($loopFile)) {
+    echo "arquivo: {$loopFile}\n";
+    echo "tamanho: " . round(@filesize($loopFile) / 1048576, 1) . " MB\n";
+    echo "idade: " . (time() - @filemtime($loopFile)) . "s\n";
+} else {
+    echo "sem arquivo ainda (baixando?)\n";
+}
+$dlPidFile = CACHE_DIR . '/loop_' . $id . '.pid';
+if (is_file($dlPidFile)) {
+    $dp = trim((string)@file_get_contents($dlPidFile));
+    $o = $rc = null;
+    @exec('kill -0 ' . (int)$dp . ' 2>/dev/null', $o, $rc);
+    echo "download pid: {$dp} vivo=" . (($rc === 0 || @is_dir('/proc/' . (int)$dp)) ? 'SIM' : 'NAO') . "\n";
+}
+$dlLogFile = CACHE_DIR . '/loop_' . $id . '.log';
+if (is_file($dlLogFile)) {
+    echo "--- download log (ultimas 8) ---\n";
+    echo implode('', array_slice(file($dlLogFile), -8));
+}
+
 echo "\n=== TESTE DE GERACAO HLS" . ($start ? ' (start=1)' : '') . " ===\n";
 $dir = __DIR__ . '/hls/' . $id;
 if (is_dir($dir)) {
@@ -63,13 +85,27 @@ if (is_dir($dir)) {
     echo "dir hls/<id> ainda nao existe\n";
 }
 
-if ($start && $u && $ff) {
-    echo "iniciando gerador (aguarde ~25s)...\n";
+if ($start && $ff) {
+    echo "iniciando download do loop (aguarde ~25s)...\n";
     @ob_flush();
     flush();
-    $ok = ensure_hls_ffmpeg($ff, $id, $u);
-    echo "resultado ensure: " . ($ok ? 'OK' : 'FALHOU') . "\n";
-    sleep(3);
+    ensure_loop_download($id);
+    $lf = null;
+    for ($i = 0; $i < 40; $i++) {
+        $lf = find_loop_cache_file($id);
+        if ($lf) break;
+        usleep(500000);
+    }
+    if ($lf) {
+        echo "arquivo disponível. iniciando ffmpeg...\n";
+        @ob_flush();
+        flush();
+        $ok = ensure_hls_ffmpeg($ff, $id, $lf);
+        echo "resultado ensure: " . ($ok ? 'OK' : 'FALHOU') . "\n";
+        sleep(2);
+    } else {
+        echo "download ainda nao terminou (veja o log do download acima e rode de novo)\n";
+    }
 }
 
 echo "\n=== HLS DIR ===\n";

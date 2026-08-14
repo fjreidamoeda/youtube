@@ -1010,33 +1010,42 @@ function serve_live_hls(string $id): void {
         return;
     }
 
-    $source = resolve_stream_url($id, 20);
-    if (!$source) {
-        http_response_code(503);
-        echo "Falha ao resolver o stream do video {$id}.";
+    // 1) Já tem o vídeo baixado em cache? usa direto (rápido, sem depender do YouTube)
+    $localFile = find_loop_cache_file($id);
+    if ($localFile) {
+        if (!ensure_hls_ffmpeg($ffmpeg, $id, $localFile)) {
+            http_response_code(503);
+            echo "Falha ao iniciar gerador HLS para {$id}.";
+            return;
+        }
+        serve_hls_manifest($id);
         return;
     }
 
-    // Fonte já é HLS (YouTube ao vivo) -> proxy do manifest real
-    if (is_playlist_url($source)) {
+    // 2) Sem arquivo local: resolve a fonte para saber se é ao vivo ou vídeo arquivado
+    $source = resolve_stream_url($id, 20);
+    if ($source && is_playlist_url($source)) {
+        // YouTube ao vivo -> proxy do manifest real (não é baixável)
         proxy_hls_vlc($source, $id);
         return;
     }
 
-    // Fonte progressiva (MP4) -> gera HLS próprio com ffmpeg
-    if (!ensure_hls_ffmpeg($ffmpeg, $id, $source)) {
-        http_response_code(503);
-        echo "Falha ao iniciar gerador HLS para {$id}.";
-        return;
-    }
+    // 3) Vídeo arquivado: baixa com yt-dlp em background e responde rápido.
+    //    O player (IBO) polia o manifest a cada poucos segundos e volta aqui.
+    ensure_loop_download($id);
+    http_response_code(503);
+    header('Retry-After: 3');
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Baixando o conteudo para gerar o canal. Tente novamente em alguns segundos.";
+}
 
+function serve_hls_manifest(string $id): void {
     $manifest = read_current_manifest($id);
     if ($manifest === null) {
         http_response_code(503);
         echo "Manifest HLS indisponível para {$id}.";
         return;
     }
-
     header('Content-Type: application/vnd.apple.mpegurl');
     header('Cache-Control: no-cache');
     header('Access-Control-Allow-Origin: *');
@@ -1068,11 +1077,17 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
         ? ' -hls_segment_type fmp4 -hls_flags delete_segments+temp_file+independent_segments'
         : ' -hls_flags delete_segments';
 
+    // Opções de entrada: arquivo local (loop já baixado) ou URL remota
+    $srcIsUrl = preg_match('~^https?://~i', $source) === 1;
+    $inputOpts = $srcIsUrl
+        ? ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+          . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
+        : '';
+
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
-         . ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+         . $inputOpts
          . ' -fflags +genpts'
-         . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
          . ' -re -stream_loop -1 -i ' . escapeshellarg($source)
          . $codecOpts . ' -f hls -hls_time 4 -hls_list_size 6'
          . $hlsOpts
@@ -1134,6 +1149,72 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
         usleep(500000);
     }
     return false;
+}
+
+/**
+ * Cache local do vídeo que será colocado em loop como canal.
+ * Estratégia: baixa o vídeo uma vez com yt-dlp (cliente moderno, que o YouTube
+ * não bloqueia com 403) e o ffmpeg só lê o arquivo local — sem depender do
+ * YouTube a cada emenda de segmento ou a cada reinício do loop.
+ */
+function loop_cache_file(string $id): string {
+    return CACHE_DIR . '/loop_' . preg_replace('~[^A-Za-z0-9_-]~', '', $id) . '.mp4';
+}
+
+function find_loop_cache_file(string $id): ?string {
+    $f = loop_cache_file($id);
+    if (is_file($f) && @filesize($f) > 1000000) return $f;
+    return null;
+}
+
+function ensure_loop_download(string $id): bool {
+    $id = preg_replace('~[^A-Za-z0-9_-]~', '', $id);
+    $file = loop_cache_file($id);
+    $pidFile = CACHE_DIR . '/loop_' . $id . '.pid';
+    $failFile = CACHE_DIR . '/loop_' . $id . '.fail';
+
+    // Arquivo fresco (baixado há < 6h) -> pronto
+    if (is_file($file) && @filesize($file) > 1000000 && (time() - @filemtime($file)) < 6 * 3600) {
+        return true;
+    }
+
+    // Falha recente? não martela o download (backoff de 2min)
+    if (is_file($failFile) && (time() - @filemtime($failFile)) < 120) {
+        return is_file($file);
+    }
+
+    // Já está baixando?
+    $pid = is_file($pidFile) ? trim((string)@file_get_contents($pidFile)) : '';
+    if ($pid !== '' && is_numeric($pid)) {
+        $o = $rc = null;
+        @exec('kill -0 ' . (int)$pid . ' 2>/dev/null', $o, $rc);
+        if ($rc === 0 || @is_dir('/proc/' . (int)$pid)) {
+            return is_file($file);
+        }
+        @unlink($pidFile);
+        // processo morreu sem concluir -> marca falha (se não tiver arquivo velho)
+        if (!is_file($file)) @file_put_contents($failFile, time());
+    }
+
+    $prep = ytdlp_prepare();
+    if (!$prep) return is_file($file);
+
+    $cmd = ytdlp_build_cmd($prep, [
+        '--no-playlist',
+        '-f', '18',
+        '--no-mtime',
+        '-o', $file,
+        'https://www.youtube.com/watch?v=' . $id,
+    ]) . ' > ' . escapeshellarg(CACHE_DIR . '/loop_' . $id . '.log') . ' 2>&1 & echo $!';
+
+    @exec($cmd, $out);
+    $np = trim($out[0] ?? '');
+    if ($np !== '') @file_put_contents($pidFile, $np);
+    @unlink($failFile);
+    log_stream("id={$id} LOOP: download em background iniciado (pid={$np})");
+
+    // Se ainda existir arquivo velho, usa como fallback enquanto baixa o novo
+    return is_file($file);
 }
 
 function read_current_manifest(string $id): ?string {
