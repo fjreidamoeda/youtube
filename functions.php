@@ -166,6 +166,43 @@ function ytdlp_src_roots(): array {
     return [CACHE_DIR . '/ytdlp_src', __DIR__ . '/ytdlp_pkg'];
 }
 
+/**
+ * Python 3.12 portátil instalado por install_py312.php (python-build-standalone).
+ * Necessário para rodar o yt-dlp atual, que decifra o nsig do YouTube —
+ * o 2023.11.16 (Python 3.7) falha em vídeos novos ("Requested format is not
+ * available" por causa de formatos THROTTLED).
+ */
+function ytdlp_modern_python(): ?string {
+    $candidates = [
+        CACHE_DIR . '/pybuild/python/bin/python3.12',
+        __DIR__ . '/cache/pybuild/python/bin/python3.12',
+        __DIR__ . '/pybuild/python/bin/python3.12',
+        '/home/container/cache/pybuild/python/bin/python3.12',
+    ];
+    foreach ($candidates as $c) {
+        if (is_file($c) && is_executable($c)) return $c;
+    }
+    return null;
+}
+
+function ytdlp_modern_prep(): ?array {
+    $py = ytdlp_modern_python();
+    if (!$py) return null;
+    $wrapper = __DIR__ . '/bin/yt-dlp-modern';
+    if (!is_file($wrapper) || !is_executable($wrapper)) {
+        $content = "#!/bin/sh\nexec " . escapeshellarg($py) . " -m yt_dlp \"\$@\"\n";
+        if (@file_put_contents($wrapper, $content) === false) return null;
+        @chmod($wrapper, 0775);
+    }
+    $cand = ['type' => 'bin', 'binary' => $wrapper];
+    if (ytdlp_test_cmd($cand)) {
+        log_stream('yt-dlp: usando yt-dlp MODERNO (Python 3.12) em ' . $wrapper);
+        $cand['ffmpeg'] = find_ffmpeg();
+        return $cand;
+    }
+    return null;
+}
+
 function ytdlp_find_python_source(): ?array {
     foreach (ytdlp_src_roots() as $root) {
         if (!is_dir($root)) continue;
@@ -276,18 +313,23 @@ function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
     $bad = ytdlp_bad_list();
 
-    // Prioridade 1: código-fonte Python já extraído (única rota que funciona
+    // Prioridade 1: yt-dlp MODERNO (Python 3.12 + yt-dlp atual) — resolve o
+    // nsig/THROTTLED dos vídeos novos, que o 2023.11.16 não decifra.
+    $mod = ytdlp_modern_prep();
+    if ($mod) return $mod;
+
+    // Prioridade 2: código-fonte Python já extraído (única rota que funcionava
     // no VPS com Python 3.7; os binários PyInstaller não extraem nesse sistema).
     $src = ytdlp_find_python_source();
     if ($src) return $src;
 
-    // Prioridade 2 (quando há download permitido): baixa o código-fonte Python.
+    // Prioridade 3 (quando há download permitido): baixa o código-fonte Python.
     if ($allowDownload) {
         $src = ytdlp_download_python_source();
         if ($src) return $src;
     }
 
-    // Prioridade 3 (quando há download permitido): binário baixado do GitHub.
+    // Prioridade 4 (quando há download permitido): binário baixado do GitHub.
     // Moderno e íntegro — evita o binário antigo do sistema que passa no
     // --version mas não extrai vídeo do YouTube atual.
     if ($allowDownload) {
@@ -295,7 +337,7 @@ function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
         if ($cand) return $cand;
     }
 
-    // Prioridade 4: yt-dlp já existente (bin/ ou PATH), fora da lista negra.
+    // Prioridade 5: yt-dlp já existente (bin/ ou PATH), fora da lista negra.
     $existing = find_existing_binary(['yt-dlp', 'yt-dlp-bin', 'yt-dlp.exe', 'yt-dlp.pyz']);
     if ($existing && !isset($bad[$existing])) {
         $isZip = substr($existing, -4) === '.pyz';
@@ -1413,11 +1455,11 @@ function ensure_loop_download(string $id): bool {
                 $pc = is_file(CACHE_DIR . '/ytdlp_prep.json') ? json_decode(@file_get_contents(CACHE_DIR . '/ytdlp_prep.json'), true) : null;
                 $bin = $pc['prep']['binary'] ?? ($pc['prep']['zipapp'] ?? '');
                 $type = $pc['prep']['type'] ?? '';
-                // Nunca marca o wrapper bin/yt-dlp nem fontes Python: são as
-                // únicas rotas que funcionam no VPS. Só entra na lista negra
-                // um binário PyInstaller baixado (yt-dlp-bin) que falhou —
-                // o próximo ciclo baixa outro do GitHub.
-                if ($bin && is_file($bin) && $type !== 'py' && basename($bin) !== 'yt-dlp') {
+                // Nunca marca o wrapper bin/yt-dlp nem bin/yt-dlp-modern nem
+                // fontes Python: são as únicas rotas que funcionam no VPS.
+                // Só entra na lista negra um binário PyInstaller baixado
+                // (yt-dlp-bin) que falhou — o próximo ciclo baixa outro do GitHub.
+                if ($bin && is_file($bin) && $type !== 'py' && !in_array(basename($bin), ['yt-dlp', 'yt-dlp-modern'])) {
                     ytdlp_mark_bad($bin);
                 }
             } else {
