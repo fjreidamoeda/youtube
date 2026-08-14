@@ -179,4 +179,11 @@ if (is_file($rl)) {
     echo implode('', array_slice($lines, -15));
 }
 
+echo "\n=== AUTO-TRIGGER DOWNLOAD ===\n";
+// Sempre que o diag é aberto, dispara o download/conserto do loop em background
+// (não precisa mais de start=1). Se o yt-dlp estiver quebrado, o bg_download.php
+// baixa um novo do GitHub e depois o vídeo.
+ensure_loop_download($id);
+echo "ensure_loop_download chamado — veja o log do download acima.\n";
+
 echo "\nFIM\n";
