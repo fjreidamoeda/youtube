@@ -6,9 +6,9 @@ define('DATA_FILE', __DIR__ . '/data.json');
 define('CACHE_DIR', __DIR__ . '/cache');
 
 // Formato dos segmentos HLS para apps com ExoPlayer (IBO etc.).
-// 'fmp4'  => segmentos CMAF .m4s (corte limpo de áudio, zero CPU, ideal para ExoPlayer)
-// 'mpegts'=> segmentos TS clássicos .ts (compatível com players antigos)
-define('HLS_SEGMENT_TYPE', 'fmp4');
+// 'mpegts'=> segmentos TS clássicos .ts (padrão; compatível com qualquer ffmpeg >= 3.x e players)
+// 'fmp4'  => segmentos CMAF .m4s (corte limpo de áudio, zero CPU, ideal p/ ExoPlayer; exige ffmpeg >= 4.0 e player moderno)
+define('HLS_SEGMENT_TYPE', 'mpegts');
 
 if (!is_dir(CACHE_DIR)) {
     @mkdir(CACHE_DIR, 0775, true);
@@ -1051,11 +1051,18 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
     $cmdFile      = $dir . '/cmd.txt';
 
     $segType = defined('HLS_SEGMENT_TYPE') && in_array(HLS_SEGMENT_TYPE, ['fmp4', 'mpegts'], true)
-        ? HLS_SEGMENT_TYPE : 'fmp4';
+        ? HLS_SEGMENT_TYPE : 'mpegts';
 
     $host = $_SERVER['HTTP_HOST'] ?? '45.143.7.108:27021';
     $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
     $baseUrl = $scheme . '://' . $host . '/hls/' . $id . '/';
+
+    // Opções do HLS por tipo de segmento:
+    // - mpegts: flags mínimas (compatível com qualquer ffmpeg >= 3.x) — configuração que já funcionou
+    // - fmp4:   segmentos CMAF .m4s (corte limpo de áudio p/ ExoPlayer; exige ffmpeg >= 4.0 e player moderno)
+    $hlsOpts = ($segType === 'fmp4')
+        ? ' -hls_segment_type fmp4 -hls_flags delete_segments+temp_file+independent_segments'
+        : ' -hls_flags delete_segments';
 
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
@@ -1064,8 +1071,7 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
          . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
          . ' -re -stream_loop -1 -i ' . escapeshellarg($source)
          . ' -c copy -f hls -hls_time 4 -hls_list_size 6'
-         . ' -hls_segment_type ' . $segType
-         . ' -hls_flags delete_segments+temp_file+independent_segments'
+         . $hlsOpts
          . ' -hls_base_url ' . escapeshellarg($baseUrl)
          . ' ' . escapeshellarg($dir . '/index.m3u8')
          . ' > ' . escapeshellarg(CACHE_DIR . '/hls_' . $id . '.log') . ' 2>&1 & echo $!';
@@ -1101,11 +1107,25 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
     @file_put_contents($cmdFile, $cmd);
     log_stream("id={$id} HLS: iniciando gerador de segmentos ({$segType}, pid={$newPid})");
 
-    // Espera o primeiro segmento aparecer (máx. ~15s)
+    // Espera o primeiro segmento aparecer (máx. ~15s), desistindo rápido se o
+    // processo morreu ou o ffmpeg reportou erro no log (loglevel error).
+    $logFile = CACHE_DIR . '/hls_' . $id . '.log';
     for ($i = 0; $i < 30; $i++) {
         if (is_file($manifestFile) && @filesize($manifestFile) > 0) {
             $content = (string)@file_get_contents($manifestFile);
             if (preg_match('/\.(ts|m4s)\b/i', $content)) return true;
+        }
+        if (is_file($logFile) && @filesize($logFile) > 0) {
+            @unlink($pidFile);
+            return false;
+        }
+        if ($newPid !== '' && is_numeric($newPid)) {
+            $o = $rc = null;
+            @exec('kill -0 ' . (int)$newPid . ' 2>/dev/null', $o, $rc);
+            if ($rc !== 0) {
+                @unlink($pidFile);
+                return false;
+            }
         }
         usleep(500000);
     }
