@@ -416,9 +416,7 @@ function resolve_via_ytdlp(string $videoId): ?string {
     // yt-dlp coloca no topo do "best" e quebra a reprodução). Prefere mp4 com
     // áudio, depois qualquer formato com áudio, depois qualquer um (sem sb).
     $formats = [
-        'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]',
-        'best[format_id!*=sb]',
-        'b',
+        'best[ext=mp4][protocol=https][vcodec!=none][acodec!=none][format_id!*=sb]/best[vcodec!=none][acodec!=none][format_id!*=sb]/b',
     ];
     foreach ($formats as $fmt) {
         $cmd = ytdlp_build_cmd($prep, array_merge(
