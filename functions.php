@@ -1057,9 +1057,13 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
     $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
     $baseUrl = $scheme . '://' . $host . '/hls/' . $id . '/';
 
-    // Opções do HLS por tipo de segmento:
-    // - mpegts: flags mínimas (compatível com qualquer ffmpeg >= 3.x) — configuração que já funcionou
-    // - fmp4:   segmentos CMAF .m4s (corte limpo de áudio p/ ExoPlayer; exige ffmpeg >= 4.0 e player moderno)
+    // Opções por tipo de segmento:
+    // - mpegts: vídeo em copy + re-encode de áudio AAC (emenda de áudio limpa p/ ExoPlayer);
+    //   compatível com qualquer ffmpeg >= 3.x e com todos os players.
+    // - fmp4:   cópia total em CMAF .m4s (corte limpo nativo; exige ffmpeg >= 4.0 e player moderno)
+    $codecOpts = ($segType === 'fmp4')
+        ? ' -c copy'
+        : ' -c:v copy -c:a aac -b:a 96k';
     $hlsOpts = ($segType === 'fmp4')
         ? ' -hls_segment_type fmp4 -hls_flags delete_segments+temp_file+independent_segments'
         : ' -hls_flags delete_segments';
@@ -1070,7 +1074,7 @@ function ensure_hls_ffmpeg(string $ffmpegPath, string $id, string $source): bool
          . ' -fflags +genpts'
          . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
          . ' -re -stream_loop -1 -i ' . escapeshellarg($source)
-         . ' -c copy -f hls -hls_time 4 -hls_list_size 6'
+         . $codecOpts . ' -f hls -hls_time 4 -hls_list_size 6'
          . $hlsOpts
          . ' -hls_base_url ' . escapeshellarg($baseUrl)
          . ' ' . escapeshellarg($dir . '/index.m3u8')
