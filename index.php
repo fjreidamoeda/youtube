@@ -17,6 +17,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add') {
         $link = trim($_POST['link'] ?? '');
         $name = trim($_POST['name'] ?? '');
+        $qty  = max(1, min(500, (int)($_POST['qty'] ?? 50)));
 
         if (!$link) {
             $msg = 'Cole um link ou ID.';
@@ -43,6 +44,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             'name' => $name,
                             'logo' => 'https://i.ytimg.com/vi/' . $norm['value'] . '/hqdefault.jpg',
                             'tvg_id' => 'yt_' . substr(md5($norm['value']), 0, 8),
+                            'max_videos' => $qty,
                         ]);
                     } else {
                         channel_add($uid, [
@@ -50,6 +52,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             'name' => $name,
                             'logo' => '',
                             'tvg_id' => 'yt_' . substr(md5($norm['value']), 0, 8),
+                            'max_videos' => $qty,
                         ]);
                     }
                     $msg = 'Adicionado com sucesso!';
@@ -61,6 +64,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'delete') {
         channel_delete_by_id((int)($_POST['id'] ?? 0), $uid);
         $msg = 'Removido com sucesso.';
+    }
+
+    if ($action === 'update_qty') {
+        channel_set_quantity((int)($_POST['id'] ?? 0), $uid, (int)($_POST['qty'] ?? 50));
+        $msg = 'Quantidade atualizada.';
     }
 
     if ($action === 'clear') {
@@ -234,6 +242,10 @@ if ($viewChannelId) {
                     <input type="text" name="name" placeholder="Nome para exibição">
                 </div>
                 <div>
+                    <label>Qtd. Vídeos (só p/ canal)</label>
+                    <input type="number" name="qty" value="50" min="1" max="500" style="width: 100%;">
+                </div>
+                <div>
                     <button class="btn" type="submit" style="width: 100%; height: 46px;">Adicionar</button>
                 </div>
             </div>
@@ -250,6 +262,7 @@ if ($viewChannelId) {
                 <tr>
                     <th>Nome / ID</th>
                     <th>Tipo</th>
+                    <th>Qtd. Vídeos</th>
                     <th>Ações</th>
                 </tr>
                 <?php foreach ($channels as $c): $isVid = !empty($c['video_id']); ?>
@@ -266,6 +279,18 @@ if ($viewChannelId) {
                         </span>
                     </td>
                     <td>
+                        <?php if ($isVid): ?>
+                            <span style="color: var(--text-muted); font-size: 13px;">—</span>
+                        <?php else: ?>
+                            <form method="post" style="display: flex; gap: 6px; align-items: center; margin: 0;">
+                                <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
+                                <input type="hidden" name="action" value="update_qty">
+                                <input type="hidden" name="id" value="<?php echo (int)$c['id']; ?>">
+                                <input type="number" name="qty" value="<?php echo (int)($c['max_videos'] ?? 50); ?>" min="1" max="500" style="width: 80px; padding: 6px; border: 1px solid var(--border); border-radius: 6px;">
+                                <button class="btn btn-small" type="submit">Salvar</button>
+                            </form>
+                        <?php endif; ?>
+                    </td>
                         <div style="display: flex; gap: 8px;">
                             <?php if (!$isVid): ?>
                                 <a href="?view=<?php echo urlencode($c['channel_id']); ?>" class="btn btn-outline btn-small">Ver Grade</a>

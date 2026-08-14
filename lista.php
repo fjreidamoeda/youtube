@@ -69,8 +69,9 @@ foreach ($channels as $c) {
             echo $liveUrl . "\n";
         }
         
-        // 2. Busca e lista todos os vídeos recentes do canal (limitado a 50 na M3U por questões de performance do player)
-        $videos = get_cached_channel_videos($channelId, YT_API_KEY, 50);
+        // 2. Busca e lista os vídeos do canal (quantidade definida pelo usuário; padrão 50)
+        $limit = max(1, min(500, (int)($c['max_videos'] ?? 50)));
+        $videos = get_cached_channel_videos($channelId, YT_API_KEY, $limit);
 
         if (empty($liveId) && empty($videos['items'])) {
             // Nada foi encontrado para este canal: provavelmente a YT_API_KEY

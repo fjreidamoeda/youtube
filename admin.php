@@ -40,6 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $uid = $id;
         $link = trim((string)($_POST['link'] ?? ''));
         $name = trim((string)($_POST['name'] ?? ''));
+        $qty  = max(1, min(500, (int)($_POST['qty'] ?? 50)));
         require_once __DIR__ . '/functions.php';
         $norm = normalize_channel_input($link);
         if (!$norm) {
@@ -61,6 +62,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'name' => $name,
                         'logo' => 'https://i.ytimg.com/vi/' . $norm['value'] . '/hqdefault.jpg',
                         'tvg_id' => 'yt_' . substr(md5($norm['value']), 0, 8),
+                        'max_videos' => $qty,
                     ]);
                 } else {
                     channel_add($uid, [
@@ -68,6 +70,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'name' => $name,
                         'logo' => '',
                         'tvg_id' => 'yt_' . substr(md5($norm['value']), 0, 8),
+                        'max_videos' => $qty,
                     ]);
                 }
                 $msg = 'Canal adicionado para o usuario #' . $uid . '.';
@@ -76,6 +79,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     } elseif ($action === 'del_channel') {
         channel_delete_by_id((int)($_POST['channel_id'] ?? 0));
         $msg = 'Canal removido.';
+    } elseif ($action === 'update_qty') {
+        channel_set_quantity((int)($_POST['channel_id'] ?? 0), (int)($_POST['id'] ?? 0), (int)($_POST['qty'] ?? 50));
+        $msg = 'Quantidade atualizada.';
     } elseif ($action === 'clear_channels') {
         channel_clear($id);
         $msg = 'Todos os canais do usuario foram removidos.';
@@ -229,6 +235,7 @@ function status_badge(string $s): string {
             <div class="row">
                 <div style="flex:2; min-width:220px;"><label>Adicionar canal/video para este usuario</label><input type="text" name="link" placeholder="Link ou ID do YouTube" required></div>
                 <div style="flex:1;"><label>Nome (opcional)</label><input type="text" name="name" placeholder="Nome para exibir"></div>
+                <div><label>Qtd. videos (so canal)</label><input type="number" name="qty" value="50" min="1" max="500" style="width:110px;"></div>
                 <div><label>&nbsp;</label><button class="btn" type="submit">Adicionar</button></div>
             </div>
         </form>
@@ -237,7 +244,7 @@ function status_badge(string $s): string {
             <p style="color:#94a3b8; padding:10px;">Nenhum canal cadastrado para este usuario.</p>
         <?php else: ?>
         <table>
-            <tr><th>ID</th><th>Nome / ID</th><th>Tipo</th><th>Acao</th></tr>
+            <tr><th>ID</th><th>Nome / ID</th><th>Tipo</th><th>Qtd. Videos</th><th>Acao</th></tr>
             <?php foreach ($viewChannels as $ch): $isVid = !empty($ch['video_id']); ?>
             <tr>
                 <td><?php echo (int)$ch['id']; ?></td>
@@ -246,6 +253,20 @@ function status_badge(string $s): string {
                     <span class="mono" style="color:#64748b;"><?php echo htmlspecialchars($isVid ? $ch['video_id'] : $ch['channel_id']); ?></span>
                 </td>
                 <td><?php echo $isVid ? 'Video Fixo' : 'Canal Dinamico'; ?></td>
+                <td>
+                    <?php if ($isVid): ?>
+                        <span style="color:#94a3b8;">—</span>
+                    <?php else: ?>
+                        <form method="post" style="display:flex; gap:6px; align-items:center; margin:0;">
+                            <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
+                            <input type="hidden" name="action" value="update_qty">
+                            <input type="hidden" name="id" value="<?php echo (int)$viewUser['id']; ?>">
+                            <input type="hidden" name="channel_id" value="<?php echo (int)$ch['id']; ?>">
+                            <input type="number" name="qty" value="<?php echo (int)($ch['max_videos'] ?? 50); ?>" min="1" max="500" style="width:80px; padding:5px 8px;">
+                            <button class="btn btn-small" type="submit">Salvar</button>
+                        </form>
+                    <?php endif; ?>
+                </td>
                 <td>
                     <?php if ($isVid): ?><a class="btn btn-gray btn-small" href="stream.php?id=<?php echo urlencode($ch['video_id']); ?>" target="_blank">Ver</a><?php endif; ?>
                     <form method="post" style="display:inline;" onsubmit="return confirm('Remover este canal?');">

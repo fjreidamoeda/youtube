@@ -48,9 +48,17 @@ function auth_init(): void {
         name TEXT NOT NULL DEFAULT '',
         logo TEXT NOT NULL DEFAULT '',
         tvg_id TEXT NOT NULL DEFAULT '',
+        max_videos INTEGER NOT NULL DEFAULT 50,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );");
+
+    // Migracao: bancos criados antes da coluna max_videos.
+    $cols = [];
+    foreach ($pdo->query('PRAGMA table_info(channels)') as $col) $cols[] = $col['name'];
+    if (!in_array('max_videos', $cols, true)) {
+        $pdo->exec('ALTER TABLE channels ADD COLUMN max_videos INTEGER NOT NULL DEFAULT 50');
+    }
 
     // Seed do admin Luciano/132004 (so na primeira vez).
     if ((int)$pdo->query('SELECT COUNT(*) FROM users')->fetchColumn() === 0) {
@@ -194,8 +202,22 @@ function channels_for_user(int $uid): array {
 }
 
 function channel_add(int $uid, array $c): void {
-    $st = auth_db()->prepare('INSERT INTO channels (user_id,video_id,channel_id,name,logo,tvg_id) VALUES (?,?,?,?,?,?)');
-    $st->execute([$uid, $c['video_id'] ?? '', $c['channel_id'] ?? '', $c['name'] ?? '', $c['logo'] ?? '', $c['tvg_id'] ?? '']);
+    $st = auth_db()->prepare('INSERT INTO channels (user_id,video_id,channel_id,name,logo,tvg_id,max_videos) VALUES (?,?,?,?,?,?,?)');
+    $st->execute([
+        $uid,
+        $c['video_id'] ?? '',
+        $c['channel_id'] ?? '',
+        $c['name'] ?? '',
+        $c['logo'] ?? '',
+        $c['tvg_id'] ?? '',
+        max(1, min(500, (int)($c['max_videos'] ?? 50))),
+    ]);
+}
+
+function channel_set_quantity(int $cid, int $uid, int $qty): void {
+    $qty = max(1, min(500, $qty));
+    $st = auth_db()->prepare('UPDATE channels SET max_videos=? WHERE id=? AND user_id=?');
+    $st->execute([$qty, $cid, $uid]);
 }
 
 function channel_delete_by_id(int $cid, ?int $uid = null): void {
