@@ -57,6 +57,26 @@ if ($bin) {
     echo "(sem yt-dlp via ytdlp_prepare)\n";
 }
 
+echo "\n== pipeline check: resolve_stream_url('kfy_SZ_wCe8', 25) ==\n";
+$u2 = resolve_stream_url('kfy_SZ_wCe8', 25);
+echo $u2 ? $u2 : '(NULL - FALHOU)' . "\n";
+
+echo "\n== bloqueado? clients alternativos para Y6gZVwSJxeU ==\n";
+if ($bin) {
+    foreach (['tv', 'web_embedded', 'android'] as $cl) {
+        $cmd3 = ytdlp_build_cmd($prep, [
+            '--extractor-args', 'youtube:player_client=' . $cl,
+            '-f', 'best[format_id!*=sb]',
+            '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates',
+            'https://www.youtube.com/watch?v=Y6gZVwSJxeU',
+        ]);
+        echo "\n--- player_client=$cl ---\nCMD: $cmd3\n";
+        $o3 = null; $rc3 = null;
+        exec($cmd3, $o3, $rc3);
+        echo "rc=$rc3\n" . implode("\n", array_slice($o3, 0, 6)) . "\n";
+    }
+}
+
 echo "\n== ultimas 25 linhas de cache/stream.log ==\n";
 $lf = CACHE_DIR . '/stream.log';
 if (is_file($lf)) {
