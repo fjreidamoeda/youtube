@@ -29,6 +29,34 @@ echo "== resolve_stream_url('Y6gZVwSJxeU', 25) ==\n";
 $u = resolve_stream_url('Y6gZVwSJxeU', 25);
 echo $u ? $u : '(NULL - FALHOU)' . "\n";
 
+$prep = ytdlp_prepare();
+$bin = $prep ? ($prep['binary'] ?? ($prep['zipapp'] ?? '')) : '';
+
+echo "\n== teste bruto: yt-dlp --get-url Y6gZVwSJxeU ==\n";
+if ($bin) {
+    $cmd = ytdlp_build_cmd($prep, [
+        '-f', 'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]',
+        '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates',
+        'https://www.youtube.com/watch?v=Y6gZVwSJxeU',
+    ]);
+    echo "CMD: $cmd\n";
+    $o = null; $rc = null;
+    exec($cmd, $o, $rc);
+    echo "rc=$rc\n" . implode("\n", array_slice($o, 0, 25)) . "\n";
+
+    echo "\n== teste de extracao (--get-title) ==\n";
+    $cmd2 = ytdlp_build_cmd($prep, [
+        '--get-title', '--no-playlist', '--no-warnings', '--no-check-certificates',
+        'https://www.youtube.com/watch?v=Y6gZVwSJxeU',
+    ]);
+    echo "CMD: $cmd2\n";
+    $o2 = null; $rc2 = null;
+    exec($cmd2, $o2, $rc2);
+    echo "rc=$rc2\n" . implode("\n", array_slice($o2, 0, 10)) . "\n";
+} else {
+    echo "(sem yt-dlp via ytdlp_prepare)\n";
+}
+
 echo "\n== ultimas 25 linhas de cache/stream.log ==\n";
 $lf = CACHE_DIR . '/stream.log';
 if (is_file($lf)) {
