@@ -103,31 +103,42 @@ function ytdlp_test_cmd(array $prep): bool {
     return $last === 0;
 }
 
-function ytdlp_prepare(): ?array {
+function ytdlp_prepare(bool $allowDownload = false): ?array {
     // Cache em arquivo para não re-testar/re-baixar o yt-dlp a cada request
     // do player (o IBO polia o manifest a cada ~6s — cada poll não pode ficar lento).
+    // IMPORTANTE: no caminho do player (allowDownload=false) NUNCA baixa nada —
+    // só usa um binário que já exista e esteja válido; o download/conserto do
+    // yt-dlp fica para o script de background (bg_download.php).
     $cache = CACHE_DIR . '/ytdlp_prep.json';
     if (is_file($cache)) {
         $pc = json_decode(@file_get_contents($cache), true);
         if (!empty($pc['prep']) && (time() - ($pc['time'] ?? 0)) < 1800) {
             $cand = $pc['prep'];
-            $cand['ffmpeg'] = find_ffmpeg();
-            return $cand;
+            $bin = $cand['binary'] ?? ($cand['zipapp'] ?? '');
+            $sig = ($bin && is_file($bin)) ? ((string)@filesize($bin) . ':' . (string)@filemtime($bin)) : '';
+            if ($sig !== '' && $sig === ($cand['sig'] ?? '')) {
+                $cand['ffmpeg'] = find_ffmpeg();
+                return $cand;
+            }
         }
     }
-    $cand = _ytdlp_prepare_uncached();
+    $cand = _ytdlp_prepare_uncached($allowDownload);
     if ($cand) {
+        $bin = $cand['binary'] ?? ($cand['zipapp'] ?? '');
+        $cand['sig'] = ($bin && is_file($bin)) ? ((string)@filesize($bin) . ':' . (string)@filemtime($bin)) : '';
         @file_put_contents($cache, json_encode(['prep' => $cand, 'time' => time()]));
     }
     return $cand;
 }
 
-function _ytdlp_prepare_uncached(): ?array {
+function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
 
-    // 0) Usa um yt-dlp já existente (colocado manualmente na pasta bin/, ou
-    // instalado no sistema) antes de tentar baixar qualquer coisa.
+    // 0) Usa um yt-dlp já existente (bin/ ou PATH). Só retorna se o teste
+    //    --version passar; se falhar e o arquivo estiver em bin/, apaga para
+    //    não ser reusado (binário corrompido é a causa do erro "Failed to
+    //    extract ... decompression resulted in return code -1").
     $existing = find_existing_binary(['yt-dlp', 'yt-dlp-bin', 'yt-dlp.exe', 'yt-dlp.pyz']);
     if ($existing) {
         $isZip = substr($existing, -4) === '.pyz';
@@ -139,25 +150,13 @@ function _ytdlp_prepare_uncached(): ?array {
             $cand['ffmpeg'] = find_ffmpeg();
             return $cand;
         }
-        log_stream('yt-dlp: binário encontrado em ' . $existing . ' mas falhou no teste --version');
+        log_stream('yt-dlp: binário ' . $existing . ' quebrado/corrompido no teste --version');
+        if (strpos($existing, $dir . DIRECTORY_SEPARATOR) === 0) @unlink($existing);
     }
 
-    $py = ytdlp_python();
-    if ($py) {
-        $zipapp = $dir . '/yt-dlp.pyz';
-        if (!is_file($zipapp) || time() - filemtime($zipapp) > 3 * 86400) {
-            $data = ytdlp_download('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp');
-            if ($data && strlen($data) > 500000) {
-                @file_put_contents($zipapp, $data);
-                @chmod($zipapp, 0755);
-            }
-        }
-        $cand = ['type' => 'py', 'python' => $py, 'zipapp' => $zipapp];
-        if (is_file($zipapp) && ytdlp_test_cmd($cand)) {
-            $cand['ffmpeg'] = find_ffmpeg();
-            return $cand;
-        }
-    }
+    // No caminho do player (GET do m3u8) NUNCA baixa yt-dlp da internet —
+    // isso deixaria a resposta lentíssima. O conserto acontece em background.
+    if (!$allowDownload) return null;
 
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
         $bin = $dir . '/yt-dlp.exe';
@@ -166,7 +165,8 @@ function _ytdlp_prepare_uncached(): ?array {
         $bin = $dir . '/yt-dlp-bin';
         $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
     }
-    if (!is_file($bin) || time() - filemtime($bin) > 3 * 86400) {
+    // Baixa (ou re-baixa se antigo demais: 14 dias) e só aceita binário testado.
+    if (!is_file($bin) || time() - filemtime($bin) > 14 * 86400) {
         $data = ytdlp_download($url);
         if ($data && strlen($data) > 1000000) {
             @file_put_contents($bin . '.tmp', $data);
@@ -177,13 +177,11 @@ function _ytdlp_prepare_uncached(): ?array {
         }
     }
     $cand = ['type' => 'bin', 'binary' => $bin];
-    if (is_file($bin) && is_executable($bin) && ytdlp_test_cmd($cand)) {
-        $cand['ffmpeg'] = find_ffmpeg();
-        return $cand;
-    }
     if (is_file($bin) && is_executable($bin)) {
         $cand['ffmpeg'] = find_ffmpeg();
-        return $cand;
+        if (ytdlp_test_cmd($cand)) return $cand;
+        log_stream('yt-dlp: download de ' . $url . ' também falhou no teste');
+        @unlink($bin);
     }
     return null;
 }
@@ -1204,38 +1202,96 @@ function ensure_loop_download(string $id): bool {
         return is_file($file);
     }
 
-    // Já está baixando?
-    $pid = is_file($pidFile) ? trim((string)@file_get_contents($pidFile)) : '';
-    if ($pid !== '' && is_numeric($pid)) {
-        $o = $rc = null;
-        @exec('kill -0 ' . (int)$pid . ' 2>/dev/null', $o, $rc);
-        if ($rc === 0 || @is_dir('/proc/' . (int)$pid)) {
-            return is_file($file);
-        }
+    // Já está baixando? (yt-dlp direto ou o script de background)
+    $pid = is_file($pidFile) ? (int)trim((string)@file_get_contents($pidFile)) : 0;
+    if ($pid > 0 && process_alive($pid)) {
+        return is_file($file);
+    }
+    if ($pid > 0) {
         @unlink($pidFile);
-        // processo morreu sem concluir -> marca falha (se não tiver arquivo velho)
-        if (!is_file($file)) @file_put_contents($failFile, time());
+        if (!is_file($file)) @file_put_contents($failFile, time()); // evita re-trigger imediato
     }
 
-    $prep = ytdlp_prepare();
-    if (!$prep) return is_file($file);
+    // Tenta iniciar com o yt-dlp existente (caminho rápido; não baixa nada).
+    $prep = ytdlp_prepare(false);
+    if ($prep) {
+        start_loop_download($id, $prep);
+        log_stream("id={$id} LOOP: download em background iniciado");
+        return is_file($file);
+    }
 
-    $cmd = ytdlp_build_cmd($prep, [
-        '--no-playlist',
-        '-f', '18',
-        '--no-mtime',
+    // Sem yt-dlp funcional: delega para o script de background, que baixa um
+    // yt-dlp novo (GitHub) e depois o vídeo, com retries. A resposta do GET
+    // continua rápida (o script roda em processo separado).
+    start_bg_loop_download($id);
+    return is_file($file);
+}
+
+function start_loop_download(string $id, array $prep): void {
+    $file = loop_cache_file($id);
+    $log = CACHE_DIR . '/loop_' . $id . '.log';
+    @unlink(CACHE_DIR . '/loop_' . $id . '.fail');
+    $args = [
+        '--no-playlist', '-f', '18/best[ext=mp4]/best',
+        '--no-mtime', '--newline', '--no-warnings', '--no-check-certificates',
         '-o', $file,
         'https://www.youtube.com/watch?v=' . $id,
-    ]) . ' > ' . escapeshellarg(CACHE_DIR . '/loop_' . $id . '.log') . ' 2>&1 & echo $!';
-
-    @exec($cmd, $out);
+    ];
+    $cmd = ytdlp_build_cmd($prep, $args);
+    @file_put_contents($log, date('c') . ' iniciando: ' . $cmd . "\n", FILE_APPEND);
+    $pidFile = CACHE_DIR . '/loop_' . $id . '.pid';
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        @exec('cmd /c start /b "" ' . $cmd . ' >> "' . str_replace('"', '\\"', $log) . '" 2>&1');
+        return;
+    }
+    @exec($cmd . ' >> ' . escapeshellarg($log) . ' 2>&1 & echo $!', $out);
     $np = trim($out[0] ?? '');
     if ($np !== '') @file_put_contents($pidFile, $np);
-    @unlink($failFile);
-    log_stream("id={$id} LOOP: download em background iniciado (pid={$np})");
+}
 
-    // Se ainda existir arquivo velho, usa como fallback enquanto baixa o novo
-    return is_file($file);
+function start_bg_loop_download(string $id): void {
+    $log = CACHE_DIR . '/loop_' . $id . '.log';
+    $script = __DIR__ . '/bg_download.php';
+    $php = find_php_cli();
+    if (!$php || !is_file($script)) {
+        @file_put_contents($log, date('c') . ' sem PHP CLI ou script de background disponível' . "\n", FILE_APPEND);
+        return;
+    }
+    $cmd = $php . ' ' . escapeshellarg($script) . ' ' . escapeshellarg($id);
+    @file_put_contents($log, date('c') . ' iniciando background (php cli): ' . $cmd . "\n", FILE_APPEND);
+    $pidFile = CACHE_DIR . '/loop_' . $id . '.pid';
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        @exec('cmd /c start /b "" ' . $cmd . ' >> "' . str_replace('"', '\\"', $log) . '" 2>&1');
+        return;
+    }
+    @exec($cmd . ' >> ' . escapeshellarg($log) . ' 2>&1 & echo $!', $out);
+    $np = trim($out[0] ?? '');
+    if ($np !== '') @file_put_contents($pidFile, $np);
+    @unlink(CACHE_DIR . '/loop_' . $id . '.fail');
+}
+
+function find_php_cli(): ?string {
+    if (defined('PHP_BINARY') && PHP_BINARY && is_file(PHP_BINARY)) return PHP_BINARY;
+    if (strtolower(PHP_OS_FAMILY) === 'windows') return 'php';
+    $out = [];
+    @exec('command -v php 2>/dev/null', $out);
+    return trim($out[0] ?? '') ?: null;
+}
+
+function process_alive(int $pid): bool {
+    if ($pid <= 0) return false;
+    if (strtolower(PHP_OS_FAMILY) !== 'windows') {
+        if (@is_dir('/proc/' . $pid)) return true;
+        $o = $rc = null;
+        @exec('kill -0 ' . $pid . ' 2>/dev/null', $o, $rc);
+        return $rc === 0;
+    }
+    $out = [];
+    @exec('tasklist /FI "PID eq ' . $pid . '" 2>NUL', $out);
+    foreach ($out as $l) {
+        if (preg_match('/\b' . $pid . '\b/', $l)) return true;
+    }
+    return false;
 }
 
 function read_current_manifest(string $id): ?string {

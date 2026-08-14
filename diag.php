@@ -80,6 +80,8 @@ if (is_file($prepCache)) {
     $pc = json_decode(@file_get_contents($prepCache), true);
     echo "yt-dlp prep cache: " . (time() - ($pc['time'] ?? 0)) . "s\n";
 }
+echo "php cli: " . (find_php_cli() ?: 'NAO ENCONTRADO') . "\n";
+echo "bg_download.php: " . (is_file(__DIR__ . '/bg_download.php') ? 'OK' : 'FALTANDO') . "\n";
 
 echo "\n=== TESTE DE GERACAO HLS" . ($start ? ' (start=1)' : '') . " ===\n";
 $dir = __DIR__ . '/hls/' . $id;
