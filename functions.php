@@ -221,6 +221,22 @@ function ytdlp_ensure_wrapper(string $wrapper, string $srcDir): bool {
     return is_file($wrapper) && is_executable($wrapper);
 }
 
+/**
+ * Args extras para o yt-dlp quando existe cache/cookies.txt (formato Netscape,
+ * exportado do navegador logado). Ajuda a destravar vídeos que o YouTube
+ * bloqueia para IP de datacenter sem conta ("live stream recording is not
+ * available", age/geo-restrictions etc.). Se o arquivo não existir, não
+ * adiciona nada — o comportamento atual é mantido.
+ */
+function yt_cookies_args(): array {
+    $f = CACHE_DIR . '/cookies.txt';
+    if (is_file($f) && @filesize($f) > 50) {
+        log_stream('yt-dlp: usando cookies de ' . $f);
+        return ['--cookies', $f];
+    }
+    return [];
+}
+
 function ytdlp_download_python_source(): ?array {
     $root = CACHE_DIR . '/ytdlp_src';
     if (!is_dir($root)) @mkdir($root, 0775, true);
@@ -362,7 +378,11 @@ function resolve_via_ytdlp(string $videoId): ?string {
         'best[format_id!*=sb]',
     ];
     foreach ($formats as $fmt) {
-        $cmd = ytdlp_build_cmd($prep, ['-f', $fmt, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates', $url]);
+        $cmd = ytdlp_build_cmd($prep, array_merge(
+            ['-f', $fmt, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates'],
+            yt_cookies_args(),
+            [$url]
+        ));
         exec($cmd, $output, $return_var);
         if ($return_var === 0) {
             foreach ($output as $line) {
@@ -1429,8 +1449,8 @@ function start_loop_download(string $id, array $prep): void {
         '--no-playlist', '-f', '18/best[ext=mp4][format_id!*=sb]/best[format_id!*=sb]',
         '--no-mtime', '--newline', '--no-warnings', '--no-check-certificates',
         '-o', $file,
-        'https://www.youtube.com/watch?v=' . $id,
     ];
+    $args = array_merge($args, yt_cookies_args(), ['https://www.youtube.com/watch?v=' . $id]);
     $cmd = ytdlp_build_cmd($prep, $args);
     @file_put_contents($log, date('c') . ' iniciando: ' . $cmd . "\n", FILE_APPEND);
     @file_put_contents(CACHE_DIR . '/loop_' . $id . '.start', (string)time());
