@@ -92,6 +92,19 @@ if ($isHead) {
 }
 
 // --- GET: resolve com orçamento normal e entrega o stream ---
+// VLC/players normais: prefere o arquivo local já baixado (loop cache). O
+// proxy direto da URL googlevideo costuma dar 403/throttling no IP do
+// datacenter; o arquivo local foi baixado via yt-dlp e toca sem depender do
+// YouTube a cada pedido.
+if (!$isIptv) {
+    $localFile = find_loop_cache_file($id);
+    if ($localFile) {
+        log_stream("id={$id} VLC: servindo loop local em {$localFile}");
+        serve_local_file($localFile);
+        exit;
+    }
+}
+
 $streamUrl = resolve_stream_url($id, 20);
 
 if (!$streamUrl) {
@@ -132,8 +145,14 @@ if ($isIptv) {
     exit;
 }
 
-// --- VLC e players normais: serve HLS reescrito ou proxy direto ---
-serve_resolved($streamUrl, $id);
+// --- VLC e players normais sem arquivo local: dispara o download do loop em
+// background e pede para tentar de novo. A primeira abertura baixa o vídeo;
+// as seguintes servem o arquivo local direto (rápido e estável).
+ensure_loop_download($id);
+http_response_code(503);
+header('Retry-After: 3');
+header('Content-Type: text/plain; charset=utf-8');
+echo "Baixando o conteudo para gerar o canal. Tente novamente em alguns segundos.";
 exit;
 
 /**

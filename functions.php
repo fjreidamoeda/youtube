@@ -489,6 +489,70 @@ function proxy_stream(string $url): void {
     curl_close($ch);
 }
 
+/**
+ * Serve um arquivo local (loop cache baixado via yt-dlp) com suporte a Range,
+ * ideal para VLC: reprodução imediata, seek e sem depender da URL googlevideo
+ * (que costuma dar 403/throttling no IP de datacenter do VPS).
+ */
+function serve_local_file(string $path): void {
+    $size = @filesize($path);
+    if (!$size || $size <= 0) {
+        http_response_code(404);
+        exit;
+    }
+    $ext = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+    $type = $ext === 'mkv' ? 'video/x-matroska' : ($ext === 'webm' ? 'video/webm' : 'video/mp4');
+    header('Accept-Ranges: bytes');
+    header('Content-Type: ' . $type);
+
+    $range = $_SERVER['HTTP_RANGE'] ?? '';
+    if ($range === '') {
+        header('Content-Length: ' . $size);
+        http_response_code(200);
+    } elseif (preg_match('/bytes=(\d*)-(\d*)/', $range, $m)) {
+        $start = $m[1] !== '' ? (int)$m[1] : 0;
+        $end   = $m[2] !== '' ? (int)$m[2] : $size - 1;
+        if ($start > $end || $start >= $size) {
+            http_response_code(416);
+            header('Content-Range: bytes */' . $size);
+            exit;
+        }
+        $end = min($end, $size - 1);
+        header('Content-Range: bytes ' . $start . '-' . $end . '/' . $size);
+        header('Content-Length: ' . ($end - $start + 1));
+        http_response_code(206);
+    } else {
+        header('Content-Length: ' . $size);
+        http_response_code(200);
+    }
+
+    set_time_limit(0);
+    @ini_set('output_buffering', '0');
+    $fh = @fopen($path, 'rb');
+    if (!$fh) exit;
+    if (isset($start)) {
+        fseek($fh, $start);
+        $left = isset($end) ? ($end - $start + 1) : ($size - $start);
+        while ($left > 0 && !feof($fh) && !connection_aborted()) {
+            $chunk = fread($fh, (int)min(65536, $left));
+            if ($chunk === false || $chunk === '') break;
+            echo $chunk;
+            $left -= strlen($chunk);
+            if (function_exists('ob_flush')) @ob_flush();
+            flush();
+        }
+    } else {
+        while (!feof($fh) && !connection_aborted()) {
+            $chunk = fread($fh, 65536);
+            if ($chunk === false || $chunk === '') break;
+            echo $chunk;
+            if (function_exists('ob_flush')) @ob_flush();
+            flush();
+        }
+    }
+    fclose($fh);
+}
+
 function url_join(string $base, string $rel): string {
     if ($rel === '' || $rel === null) return $base;
     if (strpos($rel, '://') !== false) return $rel;
