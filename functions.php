@@ -169,18 +169,56 @@ function ytdlp_src_roots(): array {
 function ytdlp_find_python_source(): ?array {
     foreach (ytdlp_src_roots() as $root) {
         if (!is_dir($root)) continue;
-        foreach (glob($root . '/*/yt-dlp') ?: [] as $w) {
-            if (!is_file($w) || !is_readable($w)) continue;
-            $cand = ['type' => 'py', 'python' => 'python3', 'zipapp' => $w];
-            if (ytdlp_test_cmd($cand)) {
-                log_stream('yt-dlp: usando código-fonte Python em ' . $w);
-                $cand['ffmpeg'] = find_ffmpeg();
-                return $cand;
+        foreach (glob($root . '/*') ?: [] as $dir) {
+            if (!is_dir($dir)) continue;
+            // 1) Script raiz yt-dlp (tarball completo do PyPI/GitHub completo).
+            $script = $dir . '/yt-dlp';
+            if (is_file($script) && is_readable($script)) {
+                $cand = ['type' => 'py', 'python' => 'python3', 'zipapp' => $script];
+                if (ytdlp_test_cmd($cand)) {
+                    log_stream('yt-dlp: usando código-fonte Python em ' . $script);
+                    $cand['ffmpeg'] = find_ffmpeg();
+                    return $cand;
+                }
+                log_stream('yt-dlp: fonte ' . $script . ' falhou no teste --version');
+                continue;
             }
-            log_stream('yt-dlp: fonte ' . $w . ' falhou no teste --version');
+            // 2) Pacote yt_dlp/ sem o script raiz (os tarballs do GitHub vêm
+            //    truncados SEM o yt-dlp raiz). Gera o wrapper bin/yt-dlp
+            //    (python3 -m yt_dlp) e usa como binário — é a única rota que
+            //    funciona no Python 3.7 do VPS.
+            if (is_dir($dir . '/yt_dlp') && is_file($dir . '/yt_dlp/__init__.py')) {
+                $wrapper = __DIR__ . '/bin/yt-dlp';
+                if (ytdlp_ensure_wrapper($wrapper, $dir)) {
+                    $cand = ['type' => 'bin', 'binary' => $wrapper];
+                    if (ytdlp_test_cmd($cand)) {
+                        log_stream('yt-dlp: usando pacote Python + wrapper em ' . $wrapper);
+                        $cand['ffmpeg'] = find_ffmpeg();
+                        return $cand;
+                    }
+                    log_stream('yt-dlp: wrapper ' . $wrapper . ' falhou no teste --version');
+                }
+            }
         }
     }
     return null;
+}
+
+/**
+ * Garante o wrapper bin/yt-dlp que roda `python3 -m yt_dlp` com PYTHONPATH
+ * apontando para a fonte. Se um wrapper válido já existir, reaproveita.
+ */
+function ytdlp_ensure_wrapper(string $wrapper, string $srcDir): bool {
+    if (is_file($wrapper) && is_readable($wrapper) && is_executable($wrapper)) {
+        return true;
+    }
+    $content = "#!/bin/sh\n"
+             . 'PYTHONPATH="' . addcslashes($srcDir, '"\\') . "\"\n"
+             . "export PYTHONPATH\n"
+             . "exec python3 -m yt_dlp \"\$@\"\n";
+    if (@file_put_contents($wrapper, $content) === false) return false;
+    @chmod($wrapper, 0775);
+    return is_file($wrapper) && is_executable($wrapper);
 }
 
 function ytdlp_download_python_source(): ?array {
@@ -253,11 +291,12 @@ function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
             $cand['ffmpeg'] = find_ffmpeg();
             return $cand;
         }
+        // Não apaga: um wrapper/source pode ser recriado por ytdlp_find_python_source.
         log_stream('yt-dlp: binário ' . $existing . ' quebrado/corrompido no teste --version');
-        if (strpos($existing, $dir . DIRECTORY_SEPARATOR) === 0) @unlink($existing);
     } elseif ($existing && isset($bad[$existing])) {
-        log_stream('yt-dlp: binário ' . $existing . ' na lista negra (falhou download); será substituído');
-        if (strpos($existing, $dir . DIRECTORY_SEPARATOR) === 0) @unlink($existing);
+        // Não apaga nem ignora para sempre: apenas tenta as prioridades acima;
+        // o wrapper/source nunca deve ser destruído pela lista negra.
+        log_stream('yt-dlp: binário ' . $existing . ' na lista negra; tentando outras rotas');
     }
 
     // No caminho do player (GET do m3u8) NUNCA baixa yt-dlp da internet —
@@ -1353,7 +1392,14 @@ function ensure_loop_download(string $id): bool {
             if ($age < 90) {
                 $pc = is_file(CACHE_DIR . '/ytdlp_prep.json') ? json_decode(@file_get_contents(CACHE_DIR . '/ytdlp_prep.json'), true) : null;
                 $bin = $pc['prep']['binary'] ?? ($pc['prep']['zipapp'] ?? '');
-                if ($bin && is_file($bin)) ytdlp_mark_bad($bin);
+                $type = $pc['prep']['type'] ?? '';
+                // Nunca marca o wrapper bin/yt-dlp nem fontes Python: são as
+                // únicas rotas que funcionam no VPS. Só entra na lista negra
+                // um binário PyInstaller baixado (yt-dlp-bin) que falhou —
+                // o próximo ciclo baixa outro do GitHub.
+                if ($bin && is_file($bin) && $type !== 'py' && basename($bin) !== 'yt-dlp') {
+                    ytdlp_mark_bad($bin);
+                }
             } else {
                 @unlink(CACHE_DIR . '/ytdlp_prep.json');
             }
