@@ -104,6 +104,25 @@ function ytdlp_test_cmd(array $prep): bool {
 }
 
 function ytdlp_prepare(): ?array {
+    // Cache em arquivo para não re-testar/re-baixar o yt-dlp a cada request
+    // do player (o IBO polia o manifest a cada ~6s — cada poll não pode ficar lento).
+    $cache = CACHE_DIR . '/ytdlp_prep.json';
+    if (is_file($cache)) {
+        $pc = json_decode(@file_get_contents($cache), true);
+        if (!empty($pc['prep']) && (time() - ($pc['time'] ?? 0)) < 1800) {
+            $cand = $pc['prep'];
+            $cand['ffmpeg'] = find_ffmpeg();
+            return $cand;
+        }
+    }
+    $cand = _ytdlp_prepare_uncached();
+    if ($cand) {
+        @file_put_contents($cache, json_encode(['prep' => $cand, 'time' => time()]));
+    }
+    return $cand;
+}
+
+function _ytdlp_prepare_uncached(): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
 
