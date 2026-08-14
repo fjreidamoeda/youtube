@@ -47,6 +47,26 @@ $u = resolve_stream_url($id, 25);
 echo "tempo: " . round(microtime(true) - $t0, 1) . "s\n";
 echo ($u ? 'OK (inicio): ' . substr($u, 0, 140) . "\n" : "FALHOU\n");
 
+echo "\n=== TESTE YT-DLP / GITHUB ===\n";
+$py = ytdlp_python();
+$v = $o2 = $rc2 = null;
+if ($py) { @exec($py . ' --version 2>&1', $o2, $rc2); $v = trim($o2[0] ?? ''); }
+echo "python: " . ($py ?: 'NAO ENCONTRADO') . " (" . ($v ?: 'sem versao') . ")\n";
+$t0 = microtime(true);
+$data = ytdlp_download('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux');
+echo "download github: " . round(microtime(true) - $t0, 1) . "s, " . ($data ? strlen($data) . ' bytes' : 'FALHOU') . "\n";
+if ($data && strlen($data) > 1000000) {
+    $tmp = CACHE_DIR . '/test_ytdlp';
+    @file_put_contents($tmp, $data);
+    @chmod($tmp, 0755);
+    $o2 = $rc2 = null;
+    @exec(escapeshellarg($tmp) . ' --version 2>&1', $o2, $rc2);
+    echo "teste --version: rc=" . $rc2 . " -> " . (trim($o2[0] ?? '') ?: 'sem saida') . "\n";
+    if ($rc2 !== 0) echo "detalhe: " . implode(' ', array_slice($o2, 0, 2)) . "\n";
+    @unlink($tmp);
+}
+echo "yt-dlp bin local: " . (is_file(__DIR__ . '/bin/yt-dlp-bin') ? 'existe' : 'nao existe') . "\n";
+
 echo "\n=== LOOP (arquivo local em cache) ===\n";
 $loopFile = loop_cache_file($id);
 if (is_file($loopFile)) {

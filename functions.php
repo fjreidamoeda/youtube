@@ -193,7 +193,9 @@ function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
 
 function ytdlp_download_binary(string $dir): ?array {
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
-        $urls = ['https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'];
+        $urls = [
+            'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe',
+        ];
         $bin = $dir . '/yt-dlp.exe';
     } else {
         $urls = [
@@ -202,27 +204,33 @@ function ytdlp_download_binary(string $dir): ?array {
         ];
         $bin = $dir . '/yt-dlp-bin';
     }
-    // Re-baixa se antigo demais (3 dias) para não envelhecer com o YouTube.
-    if (!is_file($bin) || time() - filemtime($bin) > 3 * 86400) {
-        $got = false;
-        foreach ($urls as $url) {
-            $data = ytdlp_download($url);
-            if ($data && strlen($data) > 1000000) {
-                @file_put_contents($bin . '.tmp', $data);
-                @rename($bin . '.tmp', $bin);
-                @chmod($bin, 0755);
-                $got = true;
-                break;
-            }
-            @unlink($bin . '.tmp');
-        }
-        if (!$got) log_stream('yt-dlp: falha ao baixar binário (GitHub inalcançável?)');
-    }
     $cand = ['type' => 'bin', 'binary' => $bin];
-    if (is_file($bin) && is_executable($bin)) {
+
+    // Binário recente já no disco? testa e reusa se funcionar.
+    if (is_file($bin) && time() - filemtime($bin) <= 3 * 86400) {
         $cand['ffmpeg'] = find_ffmpeg();
-        if (ytdlp_test_cmd($cand)) return $cand;
-        log_stream('yt-dlp: download de binário também falhou no teste');
+        if (is_executable($bin) && ytdlp_test_cmd($cand)) return $cand;
+        @unlink($bin);
+    }
+
+    // Baixa e TESTA cada mirror dentro do loop — só aceita um que rode.
+    // (Se o "latest" baixar mas não extrair no kernel antigo, o próximo
+    // mirror com bootloader mais velho é tentado.)
+    foreach ($urls as $url) {
+        $data = ytdlp_download($url);
+        if (!$data || strlen($data) <= 1000000) {
+            log_stream('yt-dlp: download falhou (curto) de ' . $url);
+            continue;
+        }
+        @file_put_contents($bin . '.tmp', $data);
+        @rename($bin . '.tmp', $bin);
+        @chmod($bin, 0755);
+        $cand['ffmpeg'] = find_ffmpeg();
+        if (ytdlp_test_cmd($cand)) {
+            log_stream('yt-dlp: baixado e testado OK de ' . $url);
+            return $cand;
+        }
+        log_stream('yt-dlp: binário de ' . $url . ' falhou no teste (--version)');
         @unlink($bin);
     }
     return null;
