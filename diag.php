@@ -68,6 +68,18 @@ if (is_file($dlLogFile)) {
     echo "--- download log (ultimas 8) ---\n";
     echo implode('', array_slice(file($dlLogFile), -8));
 }
+$dlFailFile = CACHE_DIR . '/loop_' . $id . '.fail';
+if (is_file($dlFailFile)) {
+    $fe = (int)@file_get_contents($dlFailFile);
+    echo "FALHA marcada ha " . (time() - $fe) . "s (backoff 120s)\n";
+} else {
+    echo "sem marcador de falha\n";
+}
+$prepCache = CACHE_DIR . '/ytdlp_prep.json';
+if (is_file($prepCache)) {
+    $pc = json_decode(@file_get_contents($prepCache), true);
+    echo "yt-dlp prep cache: " . (time() - ($pc['time'] ?? 0)) . "s\n";
+}
 
 echo "\n=== TESTE DE GERACAO HLS" . ($start ? ' (start=1)' : '') . " ===\n";
 $dir = __DIR__ . '/hls/' . $id;

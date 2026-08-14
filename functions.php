@@ -1041,8 +1041,10 @@ function serve_live_hls(string $id): void {
         return;
     }
 
-    // 2) Sem arquivo local: resolve a fonte para saber se é ao vivo ou vídeo arquivado
-    $source = resolve_stream_url($id, 20);
+    // 2) Sem arquivo local: tenta detectar canal ao vivo de forma barata (3s).
+    //    O download do loop usa o yt-dlp direto (por id), então a resolução aqui
+    //    NÃO pode travar o pedido do player (IBO polia a cada ~6s).
+    $source = resolve_stream_url($id, 3);
     if ($source && is_playlist_url($source)) {
         // YouTube ao vivo -> proxy do manifest real (não é baixável)
         proxy_hls_vlc($source, $id);
