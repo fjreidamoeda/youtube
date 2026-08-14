@@ -6,9 +6,31 @@
 //   test_chan_videos.php?c=@FLAZOEIRO          (canal por handle, URL ou ID)
 //   test_chan_videos.php?c=@FLAZOEIRO&n=20     (quantos vídeos testar, padrão 10)
 //   test_chan_videos.php?ids=ID1,ID2,ID3       (IDs diretos)
+//   test_chan_videos.php?fmt=ID1,ID2           (mostra --list-formats dos vídeos)
 require_once __DIR__ . '/functions.php';
 echo '<pre>';
 @set_time_limit(0);
+
+if (isset($_GET['fmt'])) {
+    $prep = ytdlp_prepare();
+    if (!$prep) { echo "SEM YT-DLP FUNCIONAL\n</pre>"; exit; }
+    foreach (explode(',', (string)$_GET['fmt']) as $i) {
+        $v = extract_video_id(trim($i));
+        if (!$v) continue;
+        $cmd = ytdlp_build_cmd($prep, array_merge(
+            ['--list-formats', '--no-playlist', '--no-warnings', '--no-check-certificates'],
+            yt_cookies_args(),
+            ['https://www.youtube.com/watch?v=' . $v]
+        ));
+        echo "===== formatos de {$v} =====\nCMD: $cmd\n";
+        $o = null; $rc = null;
+        exec($cmd, $o, $rc);
+        echo "rc=$rc\n" . implode("\n", array_slice($o, 0, 60)) . "\n\n";
+        @flush();
+    }
+    echo '</pre>';
+    exit;
+}
 
 function test_one(string $vid): string {
     $prep = ytdlp_prepare();
