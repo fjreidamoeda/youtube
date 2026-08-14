@@ -1,10 +1,17 @@
 <?php
+// index.php - Dashboard do usuario logado: gerencia SOMENTE os canais dele.
 require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/auth.php';
 ini_set('display_errors', 0);
+auth_init();
+require_login();
+$user = current_user();
+$uid = (int)$user['id'];
 
 $msg = '';
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    auth_check_csrf();
     $action = $_POST['action'] ?? '';
 
     if ($action === 'add') {
@@ -19,7 +26,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $msg = 'Não consegui reconhecer esse link/ID.';
             } else {
                 if ($name === '') $name = $link;
-                $channels = load_channels();
+                $channels = channels_for_user($uid);
 
                 $exists = false;
                 foreach ($channels as $ch) {
@@ -28,24 +35,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 }
 
                 if ($exists) {
-                    $msg = 'Esse canal/vídeo já está na lista.';
+                    $msg = 'Esse canal/vídeo já está na sua lista.';
                 } else {
                     if ($norm['type'] === 'video_id') {
-                        $channels[] = [
+                        channel_add($uid, [
                             'video_id' => $norm['value'],
                             'name' => $name,
                             'logo' => 'https://i.ytimg.com/vi/' . $norm['value'] . '/hqdefault.jpg',
                             'tvg_id' => 'yt_' . substr(md5($norm['value']), 0, 8),
-                        ];
+                        ]);
                     } else {
-                        $channels[] = [
+                        channel_add($uid, [
                             'channel_id' => $norm['value'],
                             'name' => $name,
                             'logo' => '',
                             'tvg_id' => 'yt_' . substr(md5($norm['value']), 0, 8),
-                        ];
+                        ]);
                     }
-                    save_channels($channels);
                     $msg = 'Adicionado com sucesso!';
                 }
             }
@@ -53,25 +59,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'delete') {
-        $idx = intval($_POST['index'] ?? -1);
-        $channels = load_channels();
-        if ($idx >= 0 && $idx < count($channels)) {
-            array_splice($channels, $idx, 1);
-            save_channels($channels);
-            $msg = 'Removido com sucesso.';
-        }
+        channel_delete_by_id((int)($_POST['id'] ?? 0), $uid);
+        $msg = 'Removido com sucesso.';
     }
 
     if ($action === 'clear') {
-        save_channels([]);
-        $msg = 'Lista completamente limpa.';
+        channel_clear($uid);
+        $msg = 'Sua lista foi completamente limpa.';
     }
 }
 
-$channels = load_channels();
+$channels = channels_for_user($uid);
 $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
 $base = $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
-$m3uUrl = $base . '/lista.php';
+$m3uIptv = m3u_link($uid, false) ?? '';
+$m3uVlc  = m3u_link($uid, true) ?? '';
 
 // Verificação de modo de exibição de Grade (View Grid)
 $viewChannelId = $_GET['view'] ?? '';
@@ -86,7 +88,7 @@ if ($viewChannelId) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>YouTube IPTV Server</title>
+<title>Painel IPTV YouTube</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
     :root {
@@ -109,6 +111,10 @@ if ($viewChannelId) {
     header h1 { font-size: 28px; font-weight: 700; color: var(--text-main); margin-bottom: 8px; }
     header p { color: var(--text-muted); font-size: 15px; }
 
+    .topbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 10px; }
+    .topbar .user { font-size: 14px; color: var(--text-muted); }
+    .topbar .user strong { color: var(--text-main); }
+
     .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); }
     .card h2 { font-size: 18px; font-weight: 600; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
     
@@ -125,6 +131,8 @@ if ($viewChannelId) {
     .btn-outline { background: transparent; color: var(--primary); border: 1px solid var(--primary); }
     .btn-outline:hover { background: #eff6ff; }
     .btn-small { padding: 6px 12px; font-size: 12px; }
+    .btn-gray { background: #64748b; }
+    .btn-gray:hover { background: #475569; }
 
     .flex-row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
     .flex-row > div { flex: 1; min-width: 200px; }
@@ -154,8 +162,18 @@ if ($viewChannelId) {
 <div class="container">
     <header>
         <h1>Painel IPTV YouTube</h1>
-        <p>Gerencie seus canais e playlists com integração avançada</p>
+        <p>Gerencie seus canais e playlists — o conteudo e exclusivo do seu login</p>
     </header>
+
+    <div class="topbar">
+        <div class="user">Conectado como <strong><?php echo htmlspecialchars($user['username']); ?></strong></div>
+        <div style="display:flex; gap:8px;">
+            <?php if ($user['role'] === 'admin'): ?>
+                <a href="admin.php" class="btn btn-gray btn-small">Painel Admin</a>
+            <?php endif; ?>
+            <a href="login.php?logout=1" class="btn btn-danger btn-small">Sair</a>
+        </div>
+    </div>
 
     <?php if ($msg): ?><div class="msg"><?php echo htmlspecialchars($msg); ?></div><?php endif; ?>
 
@@ -204,6 +222,7 @@ if ($viewChannelId) {
     <div class="card">
         <h2>Adicionar Nova Fonte</h2>
         <form method="post">
+            <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
             <input type="hidden" name="action" value="add">
             <div class="flex-row">
                 <div style="flex: 2;">
@@ -222,7 +241,7 @@ if ($viewChannelId) {
     </div>
 
     <div class="card">
-        <h2>Canais Cadastrados (<?php echo count($channels); ?>)</h2>
+        <h2>Seus Canais (<?php echo count($channels); ?>)</h2>
         <?php if (empty($channels)): ?>
             <p style="text-align: center; color: var(--text-muted); padding: 30px;">Nenhum canal configurado. Use o formulário acima.</p>
         <?php else: ?>
@@ -233,7 +252,7 @@ if ($viewChannelId) {
                     <th>Tipo</th>
                     <th>Ações</th>
                 </tr>
-                <?php foreach ($channels as $i => $c): $isVid = !empty($c['video_id']); ?>
+                <?php foreach ($channels as $c): $isVid = !empty($c['video_id']); ?>
                 <tr>
                     <td>
                         <strong style="font-size: 15px;"><?php echo htmlspecialchars($c['name']); ?></strong><br>
@@ -255,8 +274,9 @@ if ($viewChannelId) {
                             <?php endif; ?>
                             
                             <form method="post" onsubmit="return confirm('Tem certeza?')" style="margin: 0;">
+                                <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
                                 <input type="hidden" name="action" value="delete">
-                                <input type="hidden" name="index" value="<?php echo $i; ?>">
+                                <input type="hidden" name="id" value="<?php echo (int)$c['id']; ?>">
                                 <button type="submit" class="btn btn-danger btn-small">Remover</button>
                             </form>
                         </div>
@@ -269,17 +289,70 @@ if ($viewChannelId) {
     </div>
 
     <div class="card">
-        <h2>Exportar Lista M3U</h2>
-        <p style="margin-bottom: 12px; font-size: 14px; color: var(--text-muted);">Copie a URL abaixo e adicione no seu player IPTV favorito. Ela puxará a live e a grade de todos os canais cadastrados em tempo real.</p>
-        <div class="url-box" onclick="this.select(); document.execCommand('copy'); alert('Link copiado!');">
-            <?php echo htmlspecialchars($m3uUrl); ?>
-        </div>
+        <h2>Exportar Sua Lista M3U</h2>
+        <p style="margin-bottom: 16px; font-size: 14px; color: var(--text-muted);">Este link contem um token secreto unico do seu login. Quem tiver o link consegue baixar a SUA lista — nao compartilhe.</p>
         
-        <div style="margin-top: 20px; display: flex; gap: 12px;">
-            <a href="<?php echo htmlspecialchars($m3uUrl . '?download=1'); ?>" class="btn">Baixar Arquivo .m3u8</a>
-            <form method="post" onsubmit="return confirm('Isso apagará TODOS os canais. Continuar?')" style="margin: 0; margin-left: auto;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 20px;">
+            <!-- Botão IPTV -->
+            <div style="background: linear-gradient(135deg, #7c3aed, #6d28d9); border-radius: 12px; padding: 20px; color: #fff; text-align: center;">
+                <div style="margin-bottom: 10px;">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
+                    </svg>
+                </div>
+                <div style="font-weight: 700; font-size: 16px; margin-bottom: 4px;">Lista IPTV</div>
+                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 14px;">Para Xtream, XUI.One e servidores IPTV</div>
+                <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+                    <a href="<?php echo htmlspecialchars($m3uIptv); ?>" target="_blank" class="btn" style="background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); font-size: 12px; padding: 8px 14px;">Copiar URL</a>
+                    <a href="<?php echo htmlspecialchars($m3uIptv . '&download=1'); ?>" class="btn" style="background: #fff; color: #6d28d9; font-size: 12px; padding: 8px 14px;">Baixar .m3u8</a>
+                </div>
+                <div style="margin-top: 12px; background: rgba(0,0,0,0.2); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 11px; word-break: break-all; cursor: pointer; user-select: all;" onclick="navigator.clipboard.writeText(this.textContent.trim()).then(()=>alert('URL IPTV copiada!'))">
+                    <?php echo htmlspecialchars($m3uIptv); ?>
+                </div>
+            </div>
+
+            <!-- Botão VLC -->
+            <div style="background: linear-gradient(135deg, #ea580c, #dc2626); border-radius: 12px; padding: 20px; color: #fff; text-align: center;">
+                <div style="margin-bottom: 10px;">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="5 3 19 12 5 21 5 3"/>
+                    </svg>
+                </div>
+                <div style="font-weight: 700; font-size: 16px; margin-bottom: 4px;">Lista VLC</div>
+                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 14px;">Para VLC, KODI e players de desktop</div>
+                <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+                    <a href="<?php echo htmlspecialchars($m3uVlc); ?>" target="_blank" class="btn" style="background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); font-size: 12px; padding: 8px 14px;">Copiar URL</a>
+                    <a href="<?php echo htmlspecialchars($m3uVlc . '&download=1'); ?>" class="btn" style="background: #fff; color: #dc2626; font-size: 12px; padding: 8px 14px;">Baixar .m3u8</a>
+                </div>
+                <div style="margin-top: 12px; background: rgba(0,0,0,0.2); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 11px; word-break: break-all; cursor: pointer; user-select: all;" onclick="navigator.clipboard.writeText(this.textContent.trim()).then(()=>alert('URL VLC copiada!'))">
+                    <?php echo htmlspecialchars($m3uVlc); ?>
+                </div>
+            </div>
+
+            <!-- Botão Download -->
+            <div style="background: linear-gradient(135deg, #0891b2, #0e7490); border-radius: 12px; padding: 20px; color: #fff; text-align: center;">
+                <div style="margin-bottom: 10px;">
+                    <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                </div>
+                <div style="font-weight: 700; font-size: 16px; margin-bottom: 4px;">Download Direto</div>
+                <div style="font-size: 12px; opacity: 0.85; margin-bottom: 14px;">Arquivo .m3u8 genérico para importar</div>
+                <div style="display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;">
+                    <a href="<?php echo htmlspecialchars($m3uIptv . '&download=1'); ?>" class="btn" style="background: rgba(255,255,255,0.2); border: 1px solid rgba(255,255,255,0.3); font-size: 12px; padding: 8px 14px;">IPTV .m3u8</a>
+                    <a href="<?php echo htmlspecialchars($m3uVlc . '&download=1'); ?>" class="btn" style="background: #fff; color: #0e7490; font-size: 12px; padding: 8px 14px;">VLC .m3u8</a>
+                </div>
+                <div style="margin-top: 12px; background: rgba(0,0,0,0.2); border-radius: 8px; padding: 10px; font-family: monospace; font-size: 11px; word-break: break-all; cursor: pointer; user-select: all;" onclick="navigator.clipboard.writeText(this.textContent.trim()).then(()=>alert('URL copiada!'))">
+                    <?php echo htmlspecialchars($m3uIptv); ?>
+                </div>
+            </div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end;">
+            <form method="post" onsubmit="return confirm('Isso apagará TODOS os SEUS canais. Continuar?')" style="margin: 0;">
+                <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
                 <input type="hidden" name="action" value="clear">
-                <button type="submit" class="btn btn-danger">Apagar Todo o Banco</button>
+                <button type="submit" class="btn btn-danger">Apagar Todos os Meus Canais</button>
             </form>
         </div>
     </div>

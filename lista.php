@@ -1,6 +1,20 @@
 <?php
+// lista.php - Playlist M3U do usuario. Exige o token secreto do usuario
+// (?u=usuario&t=token), que o painel de cada um mostra. Sem token/valido,
+// responde 403 — ninguem lista o conteudo do outro.
 require_once __DIR__ . '/functions.php';
+require_once __DIR__ . '/auth.php';
 ini_set('display_errors', 0);
+auth_init();
+
+$u = $_GET['u'] ?? '';
+$t = $_GET['t'] ?? '';
+$owner = user_by_token($u, $t);
+if (!$owner || $owner['status'] !== 'active') {
+    http_response_code(403);
+    header('Content-Type: text/plain');
+    exit('Acesso negado: token de playlist invalido ou usuario nao ativo.');
+}
 
 $download = isset($_GET['download']) && $_GET['download'] === '1';
 if ($download) {
@@ -16,7 +30,7 @@ if ($download) {
 // Uso: lista.php?mode=vlc  ou  lista.php?mode=iptv  ou  lista.php (= iptv)
 $mode = $_GET['mode'] ?? 'iptv';
 
-$channels = load_channels();
+$channels = channels_for_user((int)$owner['id']);
 $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
 $base = $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
 
