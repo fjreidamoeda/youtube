@@ -30,7 +30,7 @@ for ($attempt = 1; $attempt <= 3; $attempt++) {
     }
 
     start_loop_download($id, $prep);
-    $deadline = time() + 240;
+    $deadline = time() + 480; // até 8 min por tentativa (vídeo de 124MB em link lento)
     while (time() < $deadline) {
         if (find_loop_cache_file($id)) break;
         $pid = (int)trim((string)@file_get_contents(CACHE_DIR . '/loop_' . $id . '.pid'));

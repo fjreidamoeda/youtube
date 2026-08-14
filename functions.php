@@ -110,7 +110,9 @@ function ytdlp_prepare(bool $allowDownload = false): ?array {
     // só usa um binário que já exista e esteja válido; o download/conserto do
     // yt-dlp fica para o script de background (bg_download.php).
     $cache = CACHE_DIR . '/ytdlp_prep.json';
-    if (is_file($cache)) {
+    // No caminho de background (allowDownload=true) NÃO usa o cache: re-prepara
+    // sempre, priorizando um binário novo baixado do GitHub.
+    if (!$allowDownload && is_file($cache)) {
         $pc = json_decode(@file_get_contents($cache), true);
         if (!empty($pc['prep']) && (time() - ($pc['time'] ?? 0)) < 1800) {
             $cand = $pc['prep'];
@@ -131,16 +133,43 @@ function ytdlp_prepare(bool $allowDownload = false): ?array {
     return $cand;
 }
 
+function ytdlp_bad_list(): array {
+    $f = CACHE_DIR . '/ytdlp_bad.txt';
+    if (!is_file($f)) return [];
+    $out = [];
+    foreach (array_filter(array_map('trim', file($f))) as $line) {
+        if (preg_match('~^([^|]+)\|(\d+)$~', $line, $m) && time() - (int)$m[2] < 4 * 3600) {
+            $out[$m[1]] = (int)$m[2];
+        }
+    }
+    return $out;
+}
+
+function ytdlp_mark_bad(string $binary): void {
+    $bad = ytdlp_bad_list();
+    $bad[$binary] = time();
+    $lines = [];
+    foreach ($bad as $b => $t) $lines[] = $b . '|' . $t;
+    @file_put_contents(CACHE_DIR . '/ytdlp_bad.txt', implode("\n", $lines) . "\n");
+    @unlink(CACHE_DIR . '/ytdlp_prep.json'); // força re-preparar
+}
+
 function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
+    $bad = ytdlp_bad_list();
 
-    // 0) Usa um yt-dlp já existente (bin/ ou PATH). Só retorna se o teste
-    //    --version passar; se falhar e o arquivo estiver em bin/, apaga para
-    //    não ser reusado (binário corrompido é a causa do erro "Failed to
-    //    extract ... decompression resulted in return code -1").
+    // Prioridade 1 (quando há download permitido): binário baixado do GitHub.
+    // Moderno e íntegro — evita o binário antigo do sistema que passa no
+    // --version mas não extrai vídeo do YouTube atual.
+    if ($allowDownload) {
+        $cand = ytdlp_download_binary($dir);
+        if ($cand) return $cand;
+    }
+
+    // Prioridade 2: yt-dlp já existente (bin/ ou PATH), fora da lista negra.
     $existing = find_existing_binary(['yt-dlp', 'yt-dlp-bin', 'yt-dlp.exe', 'yt-dlp.pyz']);
-    if ($existing) {
+    if ($existing && !isset($bad[$existing])) {
         $isZip = substr($existing, -4) === '.pyz';
         $cand = $isZip
             ? ['type' => 'py', 'python' => ytdlp_python() ?: 'python3', 'zipapp' => $existing]
@@ -152,35 +181,48 @@ function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
         }
         log_stream('yt-dlp: binário ' . $existing . ' quebrado/corrompido no teste --version');
         if (strpos($existing, $dir . DIRECTORY_SEPARATOR) === 0) @unlink($existing);
+    } elseif ($existing && isset($bad[$existing])) {
+        log_stream('yt-dlp: binário ' . $existing . ' na lista negra (falhou download); será substituído');
+        if (strpos($existing, $dir . DIRECTORY_SEPARATOR) === 0) @unlink($existing);
     }
 
     // No caminho do player (GET do m3u8) NUNCA baixa yt-dlp da internet —
     // isso deixaria a resposta lentíssima. O conserto acontece em background.
-    if (!$allowDownload) return null;
+    return null;
+}
 
+function ytdlp_download_binary(string $dir): ?array {
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        $urls = ['https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe'];
         $bin = $dir . '/yt-dlp.exe';
-        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe';
     } else {
+        $urls = [
+            'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux',
+            'https://github.com/yt-dlp/yt-dlp/releases/download/2025.06.09/yt-dlp_linux', // bootloader mais antigo (p/ kernel/glibc velhos)
+        ];
         $bin = $dir . '/yt-dlp-bin';
-        $url = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
     }
-    // Baixa (ou re-baixa se antigo demais: 14 dias) e só aceita binário testado.
-    if (!is_file($bin) || time() - filemtime($bin) > 14 * 86400) {
-        $data = ytdlp_download($url);
-        if ($data && strlen($data) > 1000000) {
-            @file_put_contents($bin . '.tmp', $data);
-            @rename($bin . '.tmp', $bin);
-            @chmod($bin, 0755);
-        } else {
+    // Re-baixa se antigo demais (3 dias) para não envelhecer com o YouTube.
+    if (!is_file($bin) || time() - filemtime($bin) > 3 * 86400) {
+        $got = false;
+        foreach ($urls as $url) {
+            $data = ytdlp_download($url);
+            if ($data && strlen($data) > 1000000) {
+                @file_put_contents($bin . '.tmp', $data);
+                @rename($bin . '.tmp', $bin);
+                @chmod($bin, 0755);
+                $got = true;
+                break;
+            }
             @unlink($bin . '.tmp');
         }
+        if (!$got) log_stream('yt-dlp: falha ao baixar binário (GitHub inalcançável?)');
     }
     $cand = ['type' => 'bin', 'binary' => $bin];
     if (is_file($bin) && is_executable($bin)) {
         $cand['ffmpeg'] = find_ffmpeg();
         if (ytdlp_test_cmd($cand)) return $cand;
-        log_stream('yt-dlp: download de ' . $url . ' também falhou no teste');
+        log_stream('yt-dlp: download de binário também falhou no teste');
         @unlink($bin);
     }
     return null;
@@ -1209,7 +1251,21 @@ function ensure_loop_download(string $id): bool {
     }
     if ($pid > 0) {
         @unlink($pidFile);
-        if (!is_file($file)) @file_put_contents($failFile, time()); // evita re-trigger imediato
+        if (!is_file($file)) {
+            @file_put_contents($failFile, time()); // evita re-trigger imediato
+            // Morreu rápido demais? provável falha de extração do yt-dlp atual
+            // (não é problema de rede). Põe o binário na lista negra para o
+            // próximo ciclo baixar um yt-dlp novo do GitHub.
+            $started = is_file(CACHE_DIR . '/loop_' . $id . '.start') ? (int)@file_get_contents(CACHE_DIR . '/loop_' . $id . '.start') : 0;
+            $age = $started ? (time() - $started) : PHP_INT_MAX;
+            if ($age < 90) {
+                $pc = is_file(CACHE_DIR . '/ytdlp_prep.json') ? json_decode(@file_get_contents(CACHE_DIR . '/ytdlp_prep.json'), true) : null;
+                $bin = $pc['prep']['binary'] ?? ($pc['prep']['zipapp'] ?? '');
+                if ($bin && is_file($bin)) ytdlp_mark_bad($bin);
+            } else {
+                @unlink(CACHE_DIR . '/ytdlp_prep.json');
+            }
+        }
     }
 
     // Tenta iniciar com o yt-dlp existente (caminho rápido; não baixa nada).
@@ -1239,6 +1295,7 @@ function start_loop_download(string $id, array $prep): void {
     ];
     $cmd = ytdlp_build_cmd($prep, $args);
     @file_put_contents($log, date('c') . ' iniciando: ' . $cmd . "\n", FILE_APPEND);
+    @file_put_contents(CACHE_DIR . '/loop_' . $id . '.start', (string)time());
     $pidFile = CACHE_DIR . '/loop_' . $id . '.pid';
     if (strtolower(PHP_OS_FAMILY) === 'windows') {
         @exec('cmd /c start /b "" ' . $cmd . ' >> "' . str_replace('"', '\\"', $log) . '" 2>&1');
