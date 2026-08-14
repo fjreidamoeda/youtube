@@ -154,12 +154,86 @@ function ytdlp_mark_bad(string $binary): void {
     @unlink(CACHE_DIR . '/ytdlp_prep.json'); // força re-preparar
 }
 
+/**
+ * Código-fonte Python do yt-dlp (extraído de um tarball do GitHub).
+ * É a única rota que FUNCIONA no VPS (Python 3.7): os binários PyInstaller
+ * (latest e 2025.06.09) não extraem nesse kernel/glibc antigo, mas o yt-dlp
+ * 2023.11.16 roda com `python3 <dir>/yt-dlp`. As pastas podem estar em
+ * cache/ytdlp_src (criada por ytdlp_download_python_source) ou em ytdlp_pkg/
+ * (criada manualmente / pelo install_ytdlp.php).
+ */
+function ytdlp_src_roots(): array {
+    return [CACHE_DIR . '/ytdlp_src', __DIR__ . '/ytdlp_pkg'];
+}
+
+function ytdlp_find_python_source(): ?array {
+    foreach (ytdlp_src_roots() as $root) {
+        if (!is_dir($root)) continue;
+        foreach (glob($root . '/*/yt-dlp') ?: [] as $w) {
+            if (!is_file($w) || !is_readable($w)) continue;
+            $cand = ['type' => 'py', 'python' => 'python3', 'zipapp' => $w];
+            if (ytdlp_test_cmd($cand)) {
+                log_stream('yt-dlp: usando código-fonte Python em ' . $w);
+                $cand['ffmpeg'] = find_ffmpeg();
+                return $cand;
+            }
+            log_stream('yt-dlp: fonte ' . $w . ' falhou no teste --version');
+        }
+    }
+    return null;
+}
+
+function ytdlp_download_python_source(): ?array {
+    $root = CACHE_DIR . '/ytdlp_src';
+    if (!is_dir($root)) @mkdir($root, 0775, true);
+    // Última versão compatível com Python 3.7 (suporte a 3.7 caiu no 2024.04.09).
+    $versions = ['2023.11.16', '2023.12.30', '2024.03.10'];
+    foreach ($versions as $v) {
+        $url = 'https://github.com/yt-dlp/yt-dlp/archive/refs/tags/' . $v . '.tar.gz';
+        $data = ytdlp_download($url);
+        if (!$data || strlen($data) < 100000) {
+            log_stream("yt-dlp: tarball {$v} falhou no download");
+            continue;
+        }
+        $tgz = $root . "/yt-dlp-{$v}.tar.gz";
+        @file_put_contents($tgz, $data);
+        $o = null;
+        $rc = null;
+        @exec('tar xzf ' . escapeshellarg($tgz) . ' -C ' . escapeshellarg($root) . ' 2>&1', $o, $rc);
+        @unlink($tgz);
+        $w = $root . "/yt-dlp-{$v}/yt-dlp";
+        if ($rc !== 0 || !is_file($w)) {
+            log_stream("yt-dlp: extração do tarball {$v} falhou");
+            continue;
+        }
+        $cand = ['type' => 'py', 'python' => 'python3', 'zipapp' => $w];
+        $cand['ffmpeg'] = find_ffmpeg();
+        if (ytdlp_test_cmd($cand)) {
+            log_stream("yt-dlp: fonte {$v} baixada e testada OK");
+            return $cand;
+        }
+        log_stream("yt-dlp: fonte {$v} baixada mas falhou no teste --version");
+    }
+    return null;
+}
+
 function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
     $dir = __DIR__ . '/bin';
     if (!is_dir($dir)) @mkdir($dir, 0775, true);
     $bad = ytdlp_bad_list();
 
-    // Prioridade 1 (quando há download permitido): binário baixado do GitHub.
+    // Prioridade 1: código-fonte Python já extraído (única rota que funciona
+    // no VPS com Python 3.7; os binários PyInstaller não extraem nesse sistema).
+    $src = ytdlp_find_python_source();
+    if ($src) return $src;
+
+    // Prioridade 2 (quando há download permitido): baixa o código-fonte Python.
+    if ($allowDownload) {
+        $src = ytdlp_download_python_source();
+        if ($src) return $src;
+    }
+
+    // Prioridade 3 (quando há download permitido): binário baixado do GitHub.
     // Moderno e íntegro — evita o binário antigo do sistema que passa no
     // --version mas não extrai vídeo do YouTube atual.
     if ($allowDownload) {
@@ -167,7 +241,7 @@ function _ytdlp_prepare_uncached(bool $allowDownload): ?array {
         if ($cand) return $cand;
     }
 
-    // Prioridade 2: yt-dlp já existente (bin/ ou PATH), fora da lista negra.
+    // Prioridade 4: yt-dlp já existente (bin/ ou PATH), fora da lista negra.
     $existing = find_existing_binary(['yt-dlp', 'yt-dlp-bin', 'yt-dlp.exe', 'yt-dlp.pyz']);
     if ($existing && !isset($bad[$existing])) {
         $isZip = substr($existing, -4) === '.pyz';
