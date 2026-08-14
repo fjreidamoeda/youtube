@@ -110,7 +110,19 @@ if (!$streamUrl) {
 if ($isIptv) {
     $ffmpeg = find_ffmpeg();
     if ($ffmpeg) {
-        serve_via_ffmpeg($ffmpeg, $streamUrl, $id);
+        // Usa o loop local (arquivo baixado) quando disponível — nunca depende
+        // da URL direta do YouTube (que é instável/403 no VPS).
+        $localFile = find_loop_cache_file($id);
+        if ($localFile) {
+            log_stream("id={$id} IPTV: usando loop local em {$localFile}");
+            serve_via_ffmpeg($ffmpeg, $localFile, $id);
+        } else {
+            ensure_loop_download($id);
+            http_response_code(503);
+            header('Retry-After: 3');
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "Baixando o conteudo para gerar o canal. Tente novamente em alguns segundos.";
+        }
         exit;
     }
     // Sem ffmpeg: tenta proxy direto do stream (funciona com MP4 progressivo)

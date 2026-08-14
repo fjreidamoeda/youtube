@@ -79,6 +79,15 @@ $prepCache = CACHE_DIR . '/ytdlp_prep.json';
 if (is_file($prepCache)) {
     $pc = json_decode(@file_get_contents($prepCache), true);
     echo "yt-dlp prep cache: " . (time() - ($pc['time'] ?? 0)) . "s\n";
+    $bin = $pc['prep']['binary'] ?? ($pc['prep']['zipapp'] ?? '');
+    if ($bin) echo "yt-dlp em uso: {$bin}\n";
+}
+$bad = ytdlp_bad_list();
+if ($bad) {
+    echo "--- lista negra yt-dlp ---\n";
+    foreach ($bad as $b => $t) echo "  {$b} (ha " . (time() - $t) . "s)\n";
+} else {
+    echo "lista negra yt-dlp: vazia\n";
 }
 echo "php cli: " . (find_php_cli() ?: 'NAO ENCONTRADO') . "\n";
 echo "bg_download.php: " . (is_file(__DIR__ . '/bg_download.php') ? 'OK' : 'FALTANDO') . "\n";
