@@ -7,9 +7,46 @@
 //   test_chan_videos.php?c=@FLAZOEIRO&n=20     (quantos vídeos testar, padrão 10)
 //   test_chan_videos.php?ids=ID1,ID2,ID3       (IDs diretos)
 //   test_chan_videos.php?fmt=ID1,ID2           (mostra --list-formats dos vídeos)
+//   test_chan_videos.php?sel=ID1,ID2           (testa vários seletores de formato)
 require_once __DIR__ . '/functions.php';
 echo '<pre>';
 @set_time_limit(0);
+
+if (isset($_GET['sel'])) {
+    $prep = ytdlp_prepare();
+    if (!$prep) { echo "SEM YT-DLP FUNCIONAL\n</pre>"; exit; }
+    $sels = [
+        '18',
+        'best',
+        'b',
+        'best[ext=mp4][protocol=https][format_id!*=sb]/best[acodec!=none][format_id!*=sb]/best[format_id!*=sb]',
+        'best[format_id!*=sb]',
+        'bestvideo+bestaudio/best',
+    ];
+    foreach (explode(',', (string)$_GET['sel']) as $i) {
+        $v = extract_video_id(trim($i));
+        if (!$v) continue;
+        echo "===== {$v} =====\n";
+        foreach ($sels as $s) {
+            $cmd = ytdlp_build_cmd($prep, array_merge(
+                ['-f', $s, '--get-url', '--no-playlist', '--no-warnings', '--no-check-certificates'],
+                yt_cookies_args(),
+                ['https://www.youtube.com/watch?v=' . $v]
+            ));
+            $o = null; $rc = null;
+            exec($cmd, $o, $rc);
+            $line = '';
+            foreach ($o as $l) { $l = trim($l); if (strpos($l, 'http') === 0) { $line = substr($l, 0, 50) . '...'; break; } }
+            if ($line === '') foreach ($o as $l) { $l = trim($l); if (stripos($l, 'ERROR') !== false) { $line = substr($l, 0, 85); break; } }
+            if ($line === '') $line = '(sem saida util)';
+            echo "  -f '" . $s . "' => rc=$rc " . $line . "\n";
+            @flush();
+        }
+        echo "\n";
+    }
+    echo '</pre>';
+    exit;
+}
 
 if (isset($_GET['fmt'])) {
     $prep = ytdlp_prepare();
