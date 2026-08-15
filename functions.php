@@ -68,6 +68,10 @@ function find_ffmpeg(): ?string {
     return find_existing_binary(['ffmpeg', 'ffmpeg.exe']);
 }
 
+function find_ffprobe(): ?string {
+    return find_existing_binary(['ffprobe', 'ffprobe.exe']);
+}
+
 function ytdlp_download(string $url): ?string {
     @set_time_limit(180);
     $ctx = stream_context_create([

@@ -24,6 +24,19 @@ if (is_file($flog)) {
     echo "\n--- cache/ffmpeg_{$id}.log: (nao existe) ---\n";
 }
 
+// ffprobe do arquivo local: resolução/SAR/DAR (imagem larga = aspect errado)
+if ($lf) {
+    echo "\n--- ffprobe do loop local ---\n";
+    $fp = find_ffprobe();
+    if ($fp) {
+        $o = $rc = null;
+        @exec(escapeshellarg($fp) . ' -v error -select_streams v:0 -show_entries stream=width,height,sample_aspect_ratio,display_aspect_ratio,avg_frame_rate -of default=noprint_wrappers=1 ' . escapeshellarg($lf), $o, $rc);
+        echo 'rc=' . $rc . "\n" . implode("\n", $o) . "\n";
+    } else {
+        echo "(ffprobe nao encontrado)\n";
+    }
+}
+
 // Testa o remux real com o primeiro segundo de saída
 $ffmpeg = find_ffmpeg();
 if ($ffmpeg && $lf) {
