@@ -1550,8 +1550,38 @@ function ensure_loop_download(string $id): bool {
     return is_file($file);
 }
 
-function start_loop_download(string $id, array $prep): void {
+/**
+ * Garante o download do loop de forma BLOQUEANTE: espera (até $maxSec) o
+ * arquivo local ficar pronto. Downloads no VPS são rápidos (datacenter a
+ * datacenter, ~100MB/s), então normalmente termina em poucos segundos — bem
+ * melhor que tentar tocar a URL direta do YouTube (403/throttle intermitente).
+ * Limpa o marcador .fail para forçar nova tentativa mesmo após falha recente.
+ */
+function wait_loop_download(string $id, int $maxSec = 20): bool {
+    $id = preg_replace('~[^A-Za-z0-9_-]~', '', $id);
     $file = loop_cache_file($id);
+    if (is_file($file) && @filesize($file) > 1000000) return true;
+
+    @unlink(CACHE_DIR . '/loop_' . $id . '.fail');
+    ensure_loop_download($id);
+
+    $start = time();
+    $sawPid = false;
+    while (time() - $start < $maxSec) {
+        if (is_file($file) && @filesize($file) > 1000000) return true;
+        $pidFile = CACHE_DIR . '/loop_' . $id . '.pid';
+        $pid = is_file($pidFile) ? (int)trim((string)@file_get_contents($pidFile)) : 0;
+        if ($pid > 0) $sawPid = true;
+        if ($pid > 0 && !process_alive($pid)) {
+            return is_file($file) && @filesize($file) > 1000000;
+        }
+        if (!$sawPid && $pid === 0 && (time() - $start) > 3) return false;
+        usleep(500000);
+    }
+    return is_file($file) && @filesize($file) > 1000000;
+}
+
+function start_loop_download(string $id, array $prep): void {    $file = loop_cache_file($id);
     $log = CACHE_DIR . '/loop_' . $id . '.log';
     @unlink(CACHE_DIR . '/loop_' . $id . '.fail');
     $args = [

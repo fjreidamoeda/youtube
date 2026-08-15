@@ -137,10 +137,21 @@ if ($isIptv) {
         }
         exit;
     }
-    // Sem arquivo local: resolve, dispara o download do loop em background
-    // (para os próximos zaps ficarem estáveis) e já toca pela URL direta
-    // (melhor esforço) em vez de devolver 503 — painel IPTV com timeout curto
-    // mostra "sem sinal" ao receber 503.
+    // Sem arquivo local: baixa em linha (rápido no VPS, datacenter a
+    // datacenter) e serve o arquivo — bem mais estável que a URL direta do
+    // YouTube (403/throttle). Só se o download não completar a tempo, tenta
+    // tocar pela URL direta (melhor esforço) em vez de devolver 503.
+    if (wait_loop_download($id, 20)) {
+        $localFile = loop_cache_file($id);
+        if ($ffmpeg) {
+            log_stream("id={$id} IPTV: baixado em linha, servindo {$localFile}");
+            serve_via_ffmpeg($ffmpeg, $localFile, $id);
+        } else {
+            log_stream("id={$id} IPTV sem ffmpeg: baixado em linha, entregando direto");
+            serve_local_file($localFile);
+        }
+        exit;
+    }
     $streamUrl = resolve_stream_url($id, 20);
     if (!$streamUrl) {
         http_response_code(503);
@@ -154,7 +165,6 @@ if ($isIptv) {
         proxy_stream($streamUrl);
         exit;
     }
-    ensure_loop_download($id);
     log_stream("id={$id} IPTV sem loop local: streaming direto da URL (melhor esforço)");
     serve_via_ffmpeg($ffmpeg, $streamUrl, $id);
     exit;
@@ -175,10 +185,25 @@ if (!$streamUrl) {
     exit;
 }
 
-// Sem arquivo local: dispara o download do loop em background e pede retry.
-// A primeira abertura baixa o vídeo; as seguintes servem o arquivo local
-// direto (rápido e estável).
-ensure_loop_download($id);
+// Sem arquivo local: baixa em linha (rápido) e serve o arquivo direto.
+// Evita o "Baixando... tente novamente" e também o streaming instável da URL.
+if (wait_loop_download($id, 20)) {
+    $localFile = loop_cache_file($id);
+    log_stream("id={$id} VLC: baixado em linha, servindo {$localFile}");
+    serve_local_file($localFile);
+    exit;
+}
+
+// Download não completou: tenta pela URL direta (melhor esforço) via ffmpeg.
+$ffmpeg = find_ffmpeg();
+if ($ffmpeg) {
+    $streamUrl = resolve_stream_url($id, 20);
+    if ($streamUrl) {
+        log_stream("id={$id} VLC sem loop local: streaming direto da URL (melhor esforço)");
+        serve_via_ffmpeg($ffmpeg, $streamUrl, $id);
+        exit;
+    }
+}
 http_response_code(503);
 header('Retry-After: 3');
 header('Content-Type: text/plain; charset=utf-8');
