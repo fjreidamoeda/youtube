@@ -259,16 +259,18 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     // -analyzeduration/probesize: probe grande o bastante para o ffmpeg achar
     //   o moov do mp4 (probe pequeno demais faz "moov atom not found").
     // -c copy: sem re-encode (velocidade máxima)
-    // -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1: corrige
-    //   o SAR anamórfico que estica a imagem (player exibe o frame na
-    //   proporção real; YouTube entrega pixels quadrados, ex. 640x360=16:9).
+    // -bsf:v h264_mp4toannexb: converte o h264 de MP4 (AVCC) para MPEG-TS
+    //   (annexb). NÃO usar h264_metadata=sample_aspect_ratio=1:1: o ':' separa
+    //   opções no bsf e o ffmpeg 4.1 aborta com "No option name near '1'" (0
+    //   bytes de saída). O loop local já é SAR 1:1/DAR 16:9 (640x360) — sem
+    //   anamorfismo para corrigir.
     // -f mpegts pipe:1: saída MPEG-TS no stdout
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
          . $inputOpts
          . ' -analyzeduration 2000000 -probesize 2000000'
          . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
 
     log_stream("id={$videoId} IPTV: iniciando ffmpeg remux para MPEG-TS");
@@ -393,7 +395,7 @@ function serve_via_concat(string $ffmpeg, string $listFile, string $channelId): 
     // o primeiro arquivo da lista isolado (remux simples).
     $testCmd = escapeshellarg($ffmpeg)
          . ' -y -hide_banner -loglevel error -t 1 -f concat -safe 0 -i ' . escapeshellarg($listFile)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1 - 2>/dev/null | wc -c';
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
     $o = $rc = null;
     @exec($testCmd, $o, $rc);
     $nbytes = (int)trim($o[0] ?? '');
@@ -422,7 +424,7 @@ function serve_via_concat(string $ffmpeg, string $listFile, string $channelId): 
          . ' -y -hide_banner -loglevel error -fflags +genpts'
          . ' -analyzeduration 500000 -probesize 500000'
          . ' -stream_loop -1 -f concat -safe 0 -i ' . escapeshellarg($listFile)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $channelId . '.log');
 
     log_stream("ch={$channelId}: iniciando ffmpeg concat (loop) para MPEG-TS");

@@ -40,11 +40,11 @@ if ($lf) {
 // Testa o remux real com o comando EXATO de produção (2s de saída, 512KB max)
 $ffmpeg = find_ffmpeg();
 if ($ffmpeg && $lf) {
-    echo "\n--- teste remux PRODUCAO (com -stream_loop -1 + h264_metadata) ---\n";
+    echo "\n--- teste remux PRODUCAO (com -stream_loop -1) ---\n";
     $cmd = escapeshellarg($ffmpeg) . ' -y -hide_banner -loglevel error'
         . ' -analyzeduration 2000000 -probesize 2000000'
         . ' -t 2 -stream_loop -1 -i ' . escapeshellarg($lf)
-        . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
+        . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
         . ' - 2>/tmp/remux_prod.log | wc -c';
     $o = null; $rc = null;
     @exec($cmd . ' 2>&1', $o, $rc);
@@ -56,7 +56,7 @@ if ($ffmpeg && $lf) {
     $cmd2 = escapeshellarg($ffmpeg) . ' -y -hide_banner -loglevel error'
         . ' -analyzeduration 500000 -probesize 500000'
         . ' -t 2 -stream_loop -1 -i ' . escapeshellarg($lf)
-        . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
+        . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
         . ' - 2>/tmp/remux_probe500.log | wc -c';
     $o2 = null; $rc2 = null;
     @exec($cmd2 . ' 2>&1', $o2, $rc2);
