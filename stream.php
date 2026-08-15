@@ -91,22 +91,59 @@ if ($isHead) {
     exit;
 }
 
-// --- GET: resolve com orçamento normal e entrega o stream ---
-// VLC/players normais: prefere o arquivo local já baixado (loop cache). O
-// proxy direto da URL googlevideo costuma dar 403/throttling no IP do
-// datacenter; o arquivo local foi baixado via yt-dlp e toca sem depender do
-// YouTube a cada pedido.
-if (!$isIptv) {
-    $localFile = find_loop_cache_file($id);
+// --- GET: entrega o stream ---
+// O arquivo local (loop cache) é a fonte confiável: baixado via yt-dlp, não
+// depende da URL googlevideo (instável/403 no IP de datacenter).
+$localFile = find_loop_cache_file($id);
+
+// --- IPTV/Xtream: MPEG-TS via ffmpeg (painéis esperam fluxo TS contínuo) ---
+// Tentar servir HLS reescrito causa "sem sinal" porque o painel não consegue
+// reprocessar os manifests reescritos a tempo. O ffmpeg remuxa (sem re-encode
+// quando possível) para MPEG-TS, o formato nativo que esses painéis entendem.
+if ($isIptv) {
+    $ffmpeg = find_ffmpeg();
     if ($localFile) {
-        log_stream("id={$id} VLC: servindo loop local em {$localFile}");
-        serve_local_file($localFile);
+        if ($ffmpeg) {
+            log_stream("id={$id} IPTV: usando loop local em {$localFile}");
+            serve_via_ffmpeg($ffmpeg, $localFile, $id);
+        } else {
+            // Sem ffmpeg: entrega o arquivo local direto (melhor que a URL
+            // direta do YouTube, que costuma dar 403 no IP do datacenter).
+            log_stream("id={$id} IPTV sem ffmpeg: entregando arquivo local direto");
+            serve_local_file($localFile);
+        }
         exit;
     }
+    // Sem arquivo local: resolve e dispara o download em background.
+    $streamUrl = resolve_stream_url($id, 20);
+    if (!$streamUrl) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Falha ao resolver o stream do video {$id}. Verifique o selftest.php e o log em cache/stream.log na pasta do app no servidor.";
+        exit;
+    }
+    if (!$ffmpeg) {
+        log_stream("id={$id} IPTV sem ffmpeg, tentando proxy direto");
+        header('Content-Type: video/mp2t');
+        proxy_stream($streamUrl);
+        exit;
+    }
+    ensure_loop_download($id);
+    http_response_code(503);
+    header('Retry-After: 3');
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Baixando o conteudo para gerar o canal. Tente novamente em alguns segundos.";
+    exit;
+}
+
+// --- VLC/players normais: arquivo local direto (mp4, com seek) ---
+if ($localFile) {
+    log_stream("id={$id} VLC: servindo loop local em {$localFile}");
+    serve_local_file($localFile);
+    exit;
 }
 
 $streamUrl = resolve_stream_url($id, 20);
-
 if (!$streamUrl) {
     http_response_code(503);
     header('Content-Type: text/plain; charset=utf-8');
@@ -114,40 +151,9 @@ if (!$streamUrl) {
     exit;
 }
 
-// --- IPTV/Xtream: converte para MPEG-TS via ffmpeg para compatibilidade ---
-// Servidores IPTV (Xtream/XUI.One) esperam um fluxo MPEG-TS contínuo.
-// Tentar servir HLS reescrito causa "sem sinal" porque o painel não consegue
-// reprocessar os manifests reescritos a tempo. A solução é usar ffmpeg para
-// remuxar (sem re-encode quando possível) para MPEG-TS, que é o formato
-// nativo que esses painéis entendem.
-if ($isIptv) {
-    $ffmpeg = find_ffmpeg();
-    if ($ffmpeg) {
-        // Usa o loop local (arquivo baixado) quando disponível — nunca depende
-        // da URL direta do YouTube (que é instável/403 no VPS).
-        $localFile = find_loop_cache_file($id);
-        if ($localFile) {
-            log_stream("id={$id} IPTV: usando loop local em {$localFile}");
-            serve_via_ffmpeg($ffmpeg, $localFile, $id);
-        } else {
-            ensure_loop_download($id);
-            http_response_code(503);
-            header('Retry-After: 3');
-            header('Content-Type: text/plain; charset=utf-8');
-            echo "Baixando o conteudo para gerar o canal. Tente novamente em alguns segundos.";
-        }
-        exit;
-    }
-    // Sem ffmpeg: tenta proxy direto do stream (funciona com MP4 progressivo)
-    log_stream("id={$id} IPTV sem ffmpeg, tentando proxy direto");
-    header('Content-Type: video/mp2t');
-    proxy_stream($streamUrl);
-    exit;
-}
-
-// --- VLC e players normais sem arquivo local: dispara o download do loop em
-// background e pede para tentar de novo. A primeira abertura baixa o vídeo;
-// as seguintes servem o arquivo local direto (rápido e estável).
+// Sem arquivo local: dispara o download do loop em background e pede retry.
+// A primeira abertura baixa o vídeo; as seguintes servem o arquivo local
+// direto (rápido e estável).
 ensure_loop_download($id);
 http_response_code(503);
 header('Retry-After: 3');
@@ -164,11 +170,6 @@ exit;
 function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId): void {
     set_time_limit(0);
     @ini_set('output_buffering', '0');
-    
-    header('Content-Type: video/mp2t');
-    header('Cache-Control: no-cache');
-    header('X-Accel-Buffering: no');
-    header('Connection: close');
 
     // Opções de entrada: -reconnect/-headers só valem para URL remota.
     // Para arquivo local (loop cache) o ffmpeg 4.1 aborta com "Option
@@ -179,8 +180,35 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
           . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
         : '';
 
+    // Validação rápida: o remux para MPEG-TS funciona com esta fonte? Se o
+    // ffmpeg abortar por qualquer motivo (opção inválida, codec, etc.), entrega
+    // a fonte direto em vez de responder vazio para o player.
+    $testCmd = escapeshellarg($ffmpegPath)
+         . ' -y -hide_banner -loglevel error -t 1 -i ' . escapeshellarg($streamUrl)
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
+    $to = $trc = null;
+    @exec($testCmd, $to, $trc);
+    $nbytes = (int)trim($to[0] ?? '');
+    if ($trc !== 0 || $nbytes < 376) {
+        log_stream("id={$videoId} IPTV: remux TS falhou na validacao (rc={$trc}, bytes={$nbytes}); entregando a fonte direto");
+        if ($srcIsUrl) {
+            header('Content-Type: video/mp2t');
+            proxy_stream($streamUrl);
+        } else {
+            serve_local_file($streamUrl);
+        }
+        exit;
+    }
+
+    header('Content-Type: video/mp2t');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    header('Connection: close');
+
     // Monta o comando ffmpeg:
-    // -reconnect 1 -reconnect_streamed 1: reconecta automaticamente se o stream cair
+    // -stream_loop -1: coloca o vídeo em loop (comportamento de canal).
+    //   O backpressure do pipe já paceia a saída para o ritmo do cliente —
+    //   sem -re, evitando edge-cases de temporização com loop+copy.
     // -analyzeduration/probesize baixos: inicia a reprodução mais rápido
     // -c copy: sem re-encode (velocidade máxima)
     // -f mpegts pipe:1: saída MPEG-TS no stdout
@@ -188,7 +216,7 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
          . ' -y -hide_banner -loglevel error'
          . $inputOpts
          . ' -analyzeduration 2000000 -probesize 2000000'
-         . ' -stream_loop -1 -re' . ' -i ' . escapeshellarg($streamUrl)
+         . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
          . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
 
@@ -202,7 +230,7 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
              . ' -y -hide_banner -loglevel error'
              . $inputOpts
              . ' -analyzeduration 2000000 -probesize 2000000'
-             . ' -stream_loop -1 -re' . ' -i ' . escapeshellarg($streamUrl)
+             . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
              . ' -c copy -f mpegts'
              . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
         $proc = popen($cmd, 'rb');
