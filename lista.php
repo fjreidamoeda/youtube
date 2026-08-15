@@ -30,6 +30,10 @@ if ($download) {
 // Uso: lista.php?mode=vlc  ou  lista.php?mode=iptv  ou  lista.php (= iptv)
 $mode = $_GET['mode'] ?? 'iptv';
 
+// ?modo=canal: cada canal vira UMA entrada que toca todos os vídeos em
+// sequência (quando um termina, começa o próximo) e repete.
+$canalMode = ($_GET['modo'] ?? '') === 'canal';
+
 $channels = channels_for_user((int)$owner['id']);
 $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
 $base = $scheme . '://' . $_SERVER['HTTP_HOST'] . rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'])), '/');
@@ -59,7 +63,16 @@ foreach ($channels as $c) {
         echo $playUrl . "\n";
     } elseif (!empty($c['channel_id'])) {
         $channelId = $c['channel_id'];
-        
+
+        // Modo canal: uma única entrada por canal, toca os vídeos em sequência.
+        if ($canalMode) {
+            $chUrl = $base . '/stream.php/c-' . $channelId . '.ts';
+            echo '#EXTINF:-1 tvg-id="' . $tvgId . '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="' . $group . '",' . $name . "\n";
+            echo '#EXTGRP:' . $group . "\n";
+            echo $chUrl . "\n";
+            continue;
+        }
+
         // 1. Verifica se está ao vivo primeiro e corta a playlist para colocar a live no topo
         $liveId = get_live_video_id_by_channel_id($channelId, YT_API_KEY);
         if ($liveId) {

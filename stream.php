@@ -48,6 +48,16 @@ if ($id === '') {
     exit('Faltou ?id=VIDEO_ID');
 }
 
+// Modo CANAL: id no formato c-CHANNELID => toca todos os vídeos do canal em
+// sequência (quando um termina, começa o próximo) e repete.
+$channelMode = false;
+$channelId = '';
+if (preg_match('~^c-([A-Za-z0-9_-]+)$~', $id, $m)) {
+    $channelMode = true;
+    $channelId = $m[1];
+    $id = '';
+}
+
 $isHead  = ($_SERVER['REQUEST_METHOD'] === 'HEAD');
 $isIptv  = is_iptv_request();
 $cacheFile = CACHE_DIR . "/yt_video_{$id}.json";
@@ -76,7 +86,7 @@ if ($isHead) {
     }
     // Sempre responde 200 com Content-Type de MPEG-TS para IPTV
     // O Xtream/XUI aceita video/mp2t e video/MP2T
-    if ($isIptv) {
+    if ($isIptv || $channelMode) {
         header('Content-Type: video/mp2t');
         http_response_code(200);
     } else {
@@ -88,6 +98,19 @@ if ($isHead) {
             http_response_code(503);
         }
     }
+    exit;
+}
+
+// --- Modo CANAL: toca todos os vídeos do canal em sequência ---
+if ($channelMode) {
+    $ffmpeg = find_ffmpeg();
+    if (!$ffmpeg) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Canal requer ffmpeg para concatenar os vídeos.";
+        exit;
+    }
+    serve_channel_ts($ffmpeg, $channelId);
     exit;
 }
 
@@ -181,24 +204,6 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
           . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
         : '';
 
-    // Validação rápida só para arquivo local: se o remux TS falhar, entrega o
-    // arquivo direto (mp4) em vez de resposta vazia. Para URL remota pula a
-    // validação (custaria baixar 1s de stream) e parte direto pro remux com
-    // reconnect — o fallback de URL seria o proxy, que falha do mesmo jeito.
-    if (!$srcIsUrl) {
-        $testCmd = escapeshellarg($ffmpegPath)
-             . ' -y -hide_banner -loglevel error -t 1 -i ' . escapeshellarg($streamUrl)
-             . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
-        $to = $trc = null;
-        @exec($testCmd, $to, $trc);
-        $nbytes = (int)trim($to[0] ?? '');
-        if ($trc !== 0 || $nbytes < 376) {
-            log_stream("id={$videoId} IPTV: remux TS falhou na validacao (rc={$trc}, bytes={$nbytes}); entregando o mp4 direto");
-            serve_local_file($streamUrl);
-            exit;
-        }
-    }
-
     header('Content-Type: video/mp2t');
     header('Cache-Control: no-cache');
     header('X-Accel-Buffering: no');
@@ -217,7 +222,7 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
          . $inputOpts
-         . ' -analyzeduration 2000000 -probesize 2000000'
+         . ' -analyzeduration 500000 -probesize 500000'
          . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
          . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
@@ -231,7 +236,7 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
         $cmd = escapeshellarg($ffmpegPath)
              . ' -y -hide_banner -loglevel error'
              . $inputOpts
-             . ' -analyzeduration 2000000 -probesize 2000000'
+             . ' -analyzeduration 500000 -probesize 500000'
              . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
              . ' -c copy -f mpegts'
              . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
@@ -244,8 +249,15 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
         echo "Falha ao iniciar ffmpeg para remuxar.";
         return;
     }
-    
-    // Lê e envia dados do ffmpeg para o cliente
+
+    stream_pipe_to_client($proc, $videoId);
+}
+
+/**
+ * Lê a saída de um processo ffmpeg (pipe) e envia para o cliente,
+ * parando quando o cliente desconecta.
+ */
+function stream_pipe_to_client($proc, string $label): void {
     while (!feof($proc)) {
         $chunk = fread($proc, 65536);
         if ($chunk === false || $chunk === '') {
@@ -255,13 +267,128 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
         echo $chunk;
         if (function_exists('ob_flush')) @ob_flush();
         flush();
-        
-        // Verifica se o cliente desconectou
+
         if (connection_aborted()) {
-            log_stream("id={$videoId} IPTV: cliente desconectou");
+            log_stream("stream {$label}: cliente desconectou");
             break;
         }
     }
     pclose($proc);
+}
+
+/**
+ * Modo CANAL: toca todos os vídeos do canal em sequência (concat), repetindo.
+ * Baixa em background os que ainda não têm arquivo local e concatena os prontos.
+ */
+function serve_channel_ts(string $ffmpeg, string $channelId): void {
+    $videos = get_cached_channel_videos($channelId, YT_API_KEY, 50);
+    $items = $videos['items'] ?? [];
+    if (empty($items)) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Canal sem vídeos.";
+        return;
+    }
+    $ids = [];
+    foreach ($items as $it) {
+        $v = $it['snippet']['resourceId']['videoId'] ?? null;
+        if ($v) $ids[] = $v;
+    }
+    if (empty($ids)) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Canal sem vídeos.";
+        return;
+    }
+
+    // Garante downloads (background) e monta a lista concat só com prontos.
+    $ready = [];
+    foreach ($ids as $v) {
+        $f = loop_cache_file($v);
+        if (is_file($f) && @filesize($f) > 1000000) {
+            $ready[] = $f;
+        } else {
+            ensure_loop_download($v);
+        }
+    }
+
+    if (empty($ready)) {
+        // Nada baixado ainda: toca o primeiro pela URL direta (melhor esforço).
+        $u = resolve_stream_url($ids[0], 20);
+        if (!$u) {
+            http_response_code(503);
+            header('Content-Type: text/plain; charset=utf-8');
+            echo "Sem conteudo pronto ainda.";
+            return;
+        }
+        log_stream("ch={$channelId}: nada baixado, tocando direto {$ids[0]}");
+        serve_via_ffmpeg($ffmpeg, $u, $ids[0]);
+        return;
+    }
+
+    $listFile = CACHE_DIR . '/concat_' . preg_replace('~[^A-Za-z0-9_-]~', '', $channelId) . '.txt';
+    $lines = '';
+    foreach ($ready as $f) {
+        $lines .= "file '" . str_replace("'", "'\\''", $f) . "'\n";
+    }
+    @file_put_contents($listFile, $lines);
+    log_stream("ch={$channelId}: servindo concat de " . count($ready) . " vídeos");
+
+    serve_via_concat($ffmpeg, $listFile, $channelId);
+}
+
+/**
+ * Streama uma lista de arquivos locais em sequência (concat demuxer), em loop,
+ * remuxando para MPEG-TS.
+ */
+function serve_via_concat(string $ffmpeg, string $listFile, string $channelId): void {
+    set_time_limit(0);
+    @ini_set('output_buffering', '0');
+
+    // Validação rápida: o concat demuxer abre a lista? Se falhar, tenta tocar
+    // o primeiro arquivo da lista isolado (remux simples).
+    $testCmd = escapeshellarg($ffmpeg)
+         . ' -y -hide_banner -loglevel error -t 1 -f concat -safe 0 -i ' . escapeshellarg($listFile)
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1 - 2>/dev/null | wc -c';
+    $o = $rc = null;
+    @exec($testCmd, $o, $rc);
+    $nbytes = (int)trim($o[0] ?? '');
+    if ($rc !== 0 || $nbytes < 376) {
+        log_stream("ch={$channelId}: concat falhou na validacao (rc={$rc}, bytes={$nbytes}); tocando 1o arquivo isolado");
+        $first = null;
+        foreach (file($listFile) as $l) {
+            if (preg_match('/^file \'(.*)\'$/', trim($l), $m)) { $first = stripcslashes($m[1]); break; }
+        }
+        if ($first && is_file($first)) {
+            serve_via_ffmpeg($ffmpeg, $first, $channelId);
+            return;
+        }
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Concat falhou.";
+        return;
+    }
+
+    header('Content-Type: video/mp2t');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    header('Connection: close');
+
+    $cmd = escapeshellarg($ffmpeg)
+         . ' -y -hide_banner -loglevel error -fflags +genpts'
+         . ' -analyzeduration 500000 -probesize 500000'
+         . ' -stream_loop -1 -f concat -safe 0 -i ' . escapeshellarg($listFile)
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
+         . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $channelId . '.log');
+
+    log_stream("ch={$channelId}: iniciando ffmpeg concat (loop) para MPEG-TS");
+
+    $proc = popen($cmd, 'rb');
+    if (!$proc) {
+        http_response_code(503);
+        echo "Falha ao iniciar ffmpeg para o canal.";
+        return;
+    }
+    stream_pipe_to_client($proc, 'ch=' . $channelId);
 }
 
