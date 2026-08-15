@@ -1648,6 +1648,102 @@ function process_alive(int $pid): bool {
     return false;
 }
 
+// ------------------------------------------------------------------
+// DOWNLOAD DE CANAIS (contínuo / selecionado)
+// ------------------------------------------------------------------
+
+/**
+ * Quantos downloads de loop estão ativos agora (limite de concorrência).
+ */
+function active_downloads(): int {
+    $n = 0;
+    foreach (glob(CACHE_DIR . '/loop_*.pid') ?: [] as $p) {
+        $pid = (int)trim((string)@file_get_contents($p));
+        if ($pid > 0 && process_alive($pid)) $n++;
+    }
+    return $n;
+}
+
+/**
+ * Garante o download (background) dos vídeos recentes de um canal. Retorna os ids.
+ */
+function ensure_channel_downloads(string $channelId, string $apiKey, int $n = 50): array {
+    $videos = get_cached_channel_videos($channelId, $apiKey, $n);
+    $ids = [];
+    foreach (($videos['items'] ?? []) as $it) {
+        $v = $it['snippet']['resourceId']['videoId'] ?? null;
+        if ($v) $ids[] = $v;
+    }
+    foreach ($ids as $v) {
+        ensure_loop_download($v);
+    }
+    return $ids;
+}
+
+/**
+ * Uma passada do download contínuo: para cada canal marcado (download=1),
+ * garante os downloads dos vídeos recentes, respeitando um limite de
+ * concorrência. Retorna um resumo.
+ */
+function watch_downloads_once(int $maxConcurrent = 3): array {
+    $res = ['canais' => 0, 'videos' => 0, 'ativos' => 0];
+    if (!defined('AUTH_DB') || !is_file(AUTH_DB) || !class_exists('PDO')) {
+        return $res;
+    }
+    $channels = [];
+    try {
+        $st = auth_db()->prepare('SELECT * FROM channels WHERE download=1 AND channel_id<>""');
+        $st->execute();
+        $channels = $st->fetchAll();
+    } catch (Throwable $e) {
+        return $res;
+    }
+    $seen = [];
+    foreach ($channels as $c) {
+        $cid = $c['channel_id'] ?? '';
+        if ($cid === '' || isset($seen[$cid])) continue;
+        $seen[$cid] = true;
+        $res['canais']++;
+        if (active_downloads() >= $maxConcurrent) break;
+        $ids = ensure_channel_downloads($cid, YT_API_KEY, (int)($c['max_videos'] ?? 50));
+        $res['videos'] += count($ids);
+    }
+    $res['ativos'] = active_downloads();
+    return $res;
+}
+
+/**
+ * Inicia o daemon de download contínuo em background (uma única instância).
+ */
+function start_watch_daemon(): bool {
+    $pidFile = CACHE_DIR . '/watch.pid';
+    $pid = is_file($pidFile) ? (int)trim((string)@file_get_contents($pidFile)) : 0;
+    if ($pid > 0 && process_alive($pid)) return true;
+    @unlink($pidFile);
+    $script = __DIR__ . '/bg_watch_downloads.php';
+    $php = find_php_cli();
+    if (!$php || !is_file($script)) return false;
+    if (strtolower(PHP_OS_FAMILY) === 'windows') {
+        @exec('cmd /c start /b "" ' . $php . ' ' . escapeshellarg($script) . ' > NUL 2>&1');
+        @file_put_contents($pidFile, (string)getmypid());
+        return true;
+    }
+    $out = [];
+    @exec($php . ' ' . escapeshellarg($script) . ' > /dev/null 2>&1 & echo $!', $out);
+    $np = trim($out[0] ?? '');
+    if ($np !== '') @file_put_contents($pidFile, $np);
+    return true;
+}
+
+/**
+ * O daemon de download contínuo está rodando?
+ */
+function watch_daemon_running(): bool {
+    $pidFile = CACHE_DIR . '/watch.pid';
+    $pid = is_file($pidFile) ? (int)trim((string)@file_get_contents($pidFile)) : 0;
+    return $pid > 0 && process_alive($pid);
+}
+
 function read_current_manifest(string $id): ?string {
     $manifestFile = __DIR__ . '/hls/' . $id . '/index.m3u8';
     if (!is_file($manifestFile)) return null;

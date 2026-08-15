@@ -71,6 +71,47 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $msg = 'Quantidade atualizada.';
     }
 
+    if ($action === 'download_selected') {
+        $channelId = preg_replace('~[^A-Za-z0-9_-]~', '', $_POST['channel_id'] ?? '');
+        $ids = $_POST['ids'] ?? [];
+        if ($channelId === '' || !is_array($ids) || count($ids) === 0) {
+            $msg = 'Selecione ao menos um vídeo.';
+        } else {
+            $n = 0;
+            foreach ($ids as $v) {
+                $v = preg_replace('~[^A-Za-z0-9_-]~', '', $v);
+                if ($v !== '') { ensure_loop_download($v); $n++; }
+            }
+            $msg = 'Baixando ' . $n . ' vídeo(s) em segundo plano.';
+        }
+    }
+
+    if ($action === 'download_all') {
+        $channelId = preg_replace('~[^A-Za-z0-9_-]~', '', $_POST['channel_id'] ?? '');
+        if ($channelId === '') {
+            $msg = 'Canal inválido.';
+        } else {
+            $qty = 50;
+            foreach (channels_for_user($uid) as $cc) {
+                if (($cc['channel_id'] ?? '') === $channelId) { $qty = (int)($cc['max_videos'] ?? 50); break; }
+            }
+            $ids = ensure_channel_downloads($channelId, YT_API_KEY, $qty);
+            $msg = 'Baixando todos os ' . count($ids) . ' vídeos do canal em segundo plano.';
+        }
+    }
+
+    if ($action === 'download_mode') {
+        $cid = (int)($_POST['id'] ?? 0);
+        $on = !empty($_POST['on']);
+        channel_set_download($cid, $uid, $on);
+        if ($on) {
+            start_watch_daemon();
+            $msg = 'Download contínuo ATIVADO para este canal.';
+        } else {
+            $msg = 'Download contínuo DESATIVADO.';
+        }
+    }
+
     if ($action === 'clear') {
         channel_clear($uid);
         $msg = 'Sua lista foi completamente limpa.';
@@ -89,6 +130,21 @@ $pageToken = $_GET['pt'] ?? '';
 $gridData = [];
 if ($viewChannelId) {
     $gridData = get_channel_videos_paginated($viewChannelId, YT_API_KEY, 15, $pageToken);
+}
+
+// Modo download: ?dl=CHANNELID
+$dlChannelId = preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['dl'] ?? '');
+$dlChannel = null;
+$dlVideos = [];
+$dlDaemon = false;
+if ($dlChannelId !== '') {
+    foreach ($channels as $cc) {
+        if (($cc['channel_id'] ?? '') === $dlChannelId) { $dlChannel = $cc; break; }
+    }
+    if ($dlChannel) {
+        $dlVideos = get_cached_channel_videos($dlChannelId, YT_API_KEY, (int)($dlChannel['max_videos'] ?? 50));
+        $dlDaemon = watch_daemon_running();
+    }
 }
 ?>
 <!DOCTYPE html>
@@ -185,7 +241,104 @@ if ($viewChannelId) {
 
     <?php if ($msg): ?><div class="msg"><?php echo htmlspecialchars($msg); ?></div><?php endif; ?>
 
-    <?php if ($viewChannelId && !empty($gridData)): ?>
+    <?php if ($dlChannelId !== '' && $dlChannel): ?>
+    <!-- Tela de Download do Canal -->
+    <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 10px; flex-wrap: wrap; gap: 8px;">
+            <h2 style="border: none; margin: 0; padding: 0;">Downloads — <?php echo htmlspecialchars($dlChannel['name']); ?></h2>
+            <a href="index.php" class="btn btn-outline btn-small">Voltar para a Lista</a>
+        </div>
+
+        <div style="background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 14px; margin-bottom: 16px; font-size: 13px;">
+            <strong>Download contínuo:</strong>
+            O monitor baixa automaticamente os vídeos novos deste canal (em segundo plano) e mantém os já baixados atualizados.
+            Status do monitor: <strong><?php echo $dlDaemon ? 'Rodando' : 'Parado'; ?></strong>
+            <?php if (!$dlDaemon): ?>— ele inicia sozinho quando você ativa abaixo.<?php endif; ?>
+            <form method="post" style="margin-top: 10px; display: flex; gap: 8px; align-items: center;">
+                <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
+                <input type="hidden" name="action" value="download_mode">
+                <input type="hidden" name="id" value="<?php echo (int)$dlChannel['id']; ?>">
+                <?php if (!empty($dlChannel['download'])): ?>
+                    <button type="submit" name="on" value="0" class="btn btn-danger btn-small">Desativar Download Contínuo</button>
+                <?php else: ?>
+                    <button type="submit" name="on" value="1" class="btn btn-small">Ativar Download Contínuo</button>
+                <?php endif; ?>
+                <span style="color: var(--text-muted); font-size: 12px;">
+                    <?php echo empty($dlChannel['download']) ? 'desativado' : 'ATIVO (até ' . (int)($dlChannel['max_videos'] ?? 50) . ' vídeos)'; ?>
+                </span>
+            </form>
+        </div>
+
+        <?php $dlItems = $dlVideos['items'] ?? []; ?>
+        <form method="post">
+            <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
+            <input type="hidden" name="action" value="download_selected">
+            <input type="hidden" name="channel_id" value="<?php echo htmlspecialchars($dlChannelId); ?>">
+            <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap;">
+                <label style="margin: 0; display: flex; gap: 6px; align-items: center; cursor: pointer;">
+                    <input type="checkbox" id="selTodas" onclick="document.querySelectorAll('.dl-check').forEach(c=>c.checked=this.checked)">
+                    Selecionar todas
+                </label>
+                <button type="submit" class="btn btn-small">Baixar Selecionadas</button>
+            </div>
+            <div class="table-responsive">
+                <table>
+                    <tr>
+                        <th style="width: 32px;"></th>
+                        <th>Vídeo</th>
+                        <th>Status</th>
+                        <th>Ações</th>
+                    </tr>
+                    <?php foreach ($dlItems as $it): ?>
+                    <?php
+                        $vId = $it['snippet']['resourceId']['videoId'] ?? '';
+                        $title = $it['snippet']['title'] ?? '';
+                        if (!$vId) continue;
+                        $lf = loop_cache_file($vId);
+                        $sz = is_file($lf) ? @filesize($lf) : 0;
+                        $st = $sz > 1000000 ? round($sz / 1048576, 1) . ' MB' : 'não baixado';
+                    ?>
+                    <tr>
+                        <td><input type="checkbox" name="ids[]" value="<?php echo htmlspecialchars($vId); ?>" class="dl-check"></td>
+                        <td>
+                            <strong style="font-size: 13px;"><?php echo htmlspecialchars($title); ?></strong><br>
+                            <span style="color: var(--text-muted); font-size: 11px; font-family: monospace;"><?php echo htmlspecialchars($vId); ?></span>
+                        </td>
+                        <td>
+                            <?php if ($sz > 1000000): ?>
+                                <span class="tag tag-channel"><?php echo $st; ?></span>
+                            <?php else: ?>
+                                <span class="tag" style="background:#f1f5f9; color:#64748b;"><?php echo $st; ?></span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <div style="display: flex; gap: 6px;">
+                                <a href="stream.php?id=<?php echo urlencode($vId); ?>" target="_blank" class="btn btn-outline btn-small">Testar</a>
+                                <form method="post" style="margin: 0;">
+                                    <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
+                                    <input type="hidden" name="action" value="download_selected">
+                                    <input type="hidden" name="channel_id" value="<?php echo htmlspecialchars($dlChannelId); ?>">
+                                    <input type="hidden" name="ids[]" value="<?php echo htmlspecialchars($vId); ?>">
+                                    <button type="submit" class="btn btn-small">Baixar</button>
+                                </form>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                </table>
+            </div>
+        </form>
+
+        <form method="post" style="margin-top: 16px;">
+            <input type="hidden" name="csrf" value="<?php echo auth_csrf(); ?>">
+            <input type="hidden" name="action" value="download_all">
+            <input type="hidden" name="channel_id" value="<?php echo htmlspecialchars($dlChannelId); ?>">
+            <button type="submit" class="btn">Baixar Todos (<?php echo count($dlItems); ?> vídeos)</button>
+        </form>
+        <p style="margin-top: 12px; font-size: 12px; color: var(--text-muted);">Os downloads rodam em segundo plano. A página não precisa ficar aberta — dê alguns minutos e recarregue para ver o status mudar.</p>
+    </div>
+
+    <?php elseif ($viewChannelId && !empty($gridData)): ?>
     <!-- Visualização de Grade do Canal -->
     <div class="card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 10px;">
@@ -294,6 +447,7 @@ if ($viewChannelId) {
                         <div style="display: flex; gap: 8px;">
                             <?php if (!$isVid): ?>
                                 <a href="?view=<?php echo urlencode($c['channel_id']); ?>" class="btn btn-outline btn-small">Ver Grade</a>
+                                <a href="?dl=<?php echo urlencode($c['channel_id']); ?>" class="btn btn-small">Baixar</a>
                             <?php else: ?>
                                 <a href="stream.php?id=<?php echo urlencode($c['video_id']); ?>" target="_blank" class="btn btn-outline btn-small">Ver Vídeo</a>
                             <?php endif; ?>

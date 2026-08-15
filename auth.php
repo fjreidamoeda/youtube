@@ -59,6 +59,9 @@ function auth_init(): void {
     if (!in_array('max_videos', $cols, true)) {
         $pdo->exec('ALTER TABLE channels ADD COLUMN max_videos INTEGER NOT NULL DEFAULT 50');
     }
+    if (!in_array('download', $cols, true)) {
+        $pdo->exec('ALTER TABLE channels ADD COLUMN download INTEGER NOT NULL DEFAULT 0');
+    }
 
     // Seed do admin Luciano/132004 (so na primeira vez).
     if ((int)$pdo->query('SELECT COUNT(*) FROM users')->fetchColumn() === 0) {
@@ -218,6 +221,11 @@ function channel_set_quantity(int $cid, int $uid, int $qty): void {
     $qty = max(1, min(500, $qty));
     $st = auth_db()->prepare('UPDATE channels SET max_videos=? WHERE id=? AND user_id=?');
     $st->execute([$qty, $cid, $uid]);
+}
+
+function channel_set_download(int $cid, int $uid, bool $on): void {
+    $st = auth_db()->prepare('UPDATE channels SET download=? WHERE id=? AND user_id=?');
+    $st->execute([$on ? 1 : 0, $cid, $uid]);
 }
 
 function channel_delete_by_id(int $cid, ?int $uid = null): void {

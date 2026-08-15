@@ -113,4 +113,21 @@ foreach ($channels as $c) {
         }
     }
 }
+
+// Download contínuo: se o dono da lista tem canal(ais) marcado(s) com
+// download=1, dispara uma passada (o painel IPTV busca esta playlist com
+// frequência — vira um "poller" que mantém os vídeos baixados). Um guard de
+// tempo evita martelar a cada fetch.
+$hasFlagged = false;
+foreach ($channels as $cc) {
+    if (!empty($cc['download']) && !empty($cc['channel_id'])) { $hasFlagged = true; break; }
+}
+if ($hasFlagged) {
+    $trig = CACHE_DIR . '/watch_trigger.txt';
+    if (!is_file($trig) || (time() - @filemtime($trig)) >= 90) {
+        @file_put_contents($trig, (string)time());
+        watch_downloads_once(2);
+    }
+}
+
 exit;
