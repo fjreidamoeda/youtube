@@ -210,13 +210,16 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     //   sem -re, evitando edge-cases de temporização com loop+copy.
     // -analyzeduration/probesize baixos: inicia a reprodução mais rápido
     // -c copy: sem re-encode (velocidade máxima)
+    // -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1: corrige
+    //   o SAR anamórfico que estica a imagem (player exibe o frame na
+    //   proporção real; YouTube entrega pixels quadrados, ex. 640x360=16:9).
     // -f mpegts pipe:1: saída MPEG-TS no stdout
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
          . $inputOpts
          . ' -analyzeduration 2000000 -probesize 2000000'
          . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
+         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
 
     log_stream("id={$videoId} IPTV: iniciando ffmpeg remux para MPEG-TS");
