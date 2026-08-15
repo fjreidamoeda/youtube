@@ -114,7 +114,10 @@ if ($isIptv) {
         }
         exit;
     }
-    // Sem arquivo local: resolve e dispara o download em background.
+    // Sem arquivo local: resolve, dispara o download do loop em background
+    // (para os próximos zaps ficarem estáveis) e já toca pela URL direta
+    // (melhor esforço) em vez de devolver 503 — painel IPTV com timeout curto
+    // mostra "sem sinal" ao receber 503.
     $streamUrl = resolve_stream_url($id, 20);
     if (!$streamUrl) {
         http_response_code(503);
@@ -129,10 +132,8 @@ if ($isIptv) {
         exit;
     }
     ensure_loop_download($id);
-    http_response_code(503);
-    header('Retry-After: 3');
-    header('Content-Type: text/plain; charset=utf-8');
-    echo "Baixando o conteudo para gerar o canal. Tente novamente em alguns segundos.";
+    log_stream("id={$id} IPTV sem loop local: streaming direto da URL (melhor esforço)");
+    serve_via_ffmpeg($ffmpeg, $streamUrl, $id);
     exit;
 }
 
@@ -180,24 +181,22 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
           . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
         : '';
 
-    // Validação rápida: o remux para MPEG-TS funciona com esta fonte? Se o
-    // ffmpeg abortar por qualquer motivo (opção inválida, codec, etc.), entrega
-    // a fonte direto em vez de responder vazio para o player.
-    $testCmd = escapeshellarg($ffmpegPath)
-         . ' -y -hide_banner -loglevel error -t 1 -i ' . escapeshellarg($streamUrl)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
-    $to = $trc = null;
-    @exec($testCmd, $to, $trc);
-    $nbytes = (int)trim($to[0] ?? '');
-    if ($trc !== 0 || $nbytes < 376) {
-        log_stream("id={$videoId} IPTV: remux TS falhou na validacao (rc={$trc}, bytes={$nbytes}); entregando a fonte direto");
-        if ($srcIsUrl) {
-            header('Content-Type: video/mp2t');
-            proxy_stream($streamUrl);
-        } else {
+    // Validação rápida só para arquivo local: se o remux TS falhar, entrega o
+    // arquivo direto (mp4) em vez de resposta vazia. Para URL remota pula a
+    // validação (custaria baixar 1s de stream) e parte direto pro remux com
+    // reconnect — o fallback de URL seria o proxy, que falha do mesmo jeito.
+    if (!$srcIsUrl) {
+        $testCmd = escapeshellarg($ffmpegPath)
+             . ' -y -hide_banner -loglevel error -t 1 -i ' . escapeshellarg($streamUrl)
+             . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
+        $to = $trc = null;
+        @exec($testCmd, $to, $trc);
+        $nbytes = (int)trim($to[0] ?? '');
+        if ($trc !== 0 || $nbytes < 376) {
+            log_stream("id={$videoId} IPTV: remux TS falhou na validacao (rc={$trc}, bytes={$nbytes}); entregando o mp4 direto");
             serve_local_file($streamUrl);
+            exit;
         }
-        exit;
     }
 
     header('Content-Type: video/mp2t');
