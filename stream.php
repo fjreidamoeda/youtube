@@ -169,7 +169,16 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     header('Cache-Control: no-cache');
     header('X-Accel-Buffering: no');
     header('Connection: close');
-    
+
+    // Opções de entrada: -reconnect/-headers só valem para URL remota.
+    // Para arquivo local (loop cache) o ffmpeg 4.1 aborta com "Option
+    // reconnect not found".
+    $srcIsUrl = preg_match('~^https?://~i', $streamUrl) === 1;
+    $inputOpts = $srcIsUrl
+        ? ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+          . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
+        : '';
+
     // Monta o comando ffmpeg:
     // -reconnect 1 -reconnect_streamed 1: reconecta automaticamente se o stream cair
     // -analyzeduration/probesize baixos: inicia a reprodução mais rápido
@@ -177,24 +186,22 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     // -f mpegts pipe:1: saída MPEG-TS no stdout
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
-         . ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+         . $inputOpts
          . ' -analyzeduration 2000000 -probesize 2000000'
-         . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
          . ' -stream_loop -1 -re' . ' -i ' . escapeshellarg($streamUrl)
          . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
-    
+
     log_stream("id={$videoId} IPTV: iniciando ffmpeg remux para MPEG-TS");
-    
+
     // Tenta com copy primeiro
     $proc = popen($cmd, 'rb');
     if (!$proc) {
         // Fallback: tenta sem bsf (para streams que já são annexb ou não são h264)
         $cmd = escapeshellarg($ffmpegPath)
              . ' -y -hide_banner -loglevel error'
-             . ' -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+             . $inputOpts
              . ' -analyzeduration 2000000 -probesize 2000000'
-             . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
              . ' -stream_loop -1 -re' . ' -i ' . escapeshellarg($streamUrl)
              . ' -c copy -f mpegts'
              . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
