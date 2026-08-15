@@ -204,6 +204,24 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
           . ' -headers "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\nReferer: https://www.youtube.com/\r\nOrigin: https://www.youtube.com"'
         : '';
 
+    // Validação rápida só para arquivo local: se o remux TS falhar por qualquer
+    // motivo (opção inválida, probe pequeno, codec), entrega o arquivo direto
+    // (mp4) em vez de resposta vazia. Para URL remota pula a validação
+    // (custaria baixar 1s de stream) e parte direto pro remux com reconnect.
+    if (!$srcIsUrl) {
+        $testCmd = escapeshellarg($ffmpegPath)
+             . ' -y -hide_banner -loglevel error -t 1 -i ' . escapeshellarg($streamUrl)
+             . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
+        $to = $trc = null;
+        @exec($testCmd, $to, $trc);
+        $nbytes = (int)trim($to[0] ?? '');
+        if ($trc !== 0 || $nbytes < 376) {
+            log_stream("id={$videoId} IPTV: remux TS falhou na validacao (rc={$trc}, bytes={$nbytes}); entregando o mp4 direto");
+            serve_local_file($streamUrl);
+            exit;
+        }
+    }
+
     header('Content-Type: video/mp2t');
     header('Cache-Control: no-cache');
     header('X-Accel-Buffering: no');
@@ -213,7 +231,8 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     // -stream_loop -1: coloca o vídeo em loop (comportamento de canal).
     //   O backpressure do pipe já paceia a saída para o ritmo do cliente —
     //   sem -re, evitando edge-cases de temporização com loop+copy.
-    // -analyzeduration/probesize baixos: inicia a reprodução mais rápido
+    // -analyzeduration/probesize: probe grande o bastante para o ffmpeg achar
+    //   o moov do mp4 (probe pequeno demais faz "moov atom not found").
     // -c copy: sem re-encode (velocidade máxima)
     // -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1: corrige
     //   o SAR anamórfico que estica a imagem (player exibe o frame na
@@ -222,7 +241,7 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
     $cmd = escapeshellarg($ffmpegPath)
          . ' -y -hide_banner -loglevel error'
          . $inputOpts
-         . ' -analyzeduration 500000 -probesize 500000'
+         . ' -analyzeduration 2000000 -probesize 2000000'
          . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
          . ' -c copy -f mpegts -bsf:v h264_mp4toannexb,h264_metadata=sample_aspect_ratio=1:1'
          . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
@@ -236,7 +255,7 @@ function serve_via_ffmpeg(string $ffmpegPath, string $streamUrl, string $videoId
         $cmd = escapeshellarg($ffmpegPath)
              . ' -y -hide_banner -loglevel error'
              . $inputOpts
-             . ' -analyzeduration 500000 -probesize 500000'
+             . ' -analyzeduration 2000000 -probesize 2000000'
              . ' -stream_loop -1 -i ' . escapeshellarg($streamUrl)
              . ' -c copy -f mpegts'
              . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $videoId . '.log');
