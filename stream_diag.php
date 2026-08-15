@@ -3,6 +3,39 @@
 // do ffmpeg (por que o VLC não abre). Uso: stream_diag.php?id=ID
 require_once __DIR__ . '/functions.php';
 header('Content-Type: text/plain; charset=utf-8');
+
+// ?c=CHANNELID: varre o canal mostrando cada vídeo, status do loop e dimensões.
+if (isset($_GET['c']) && $_GET['c'] !== '') {
+    $channelId = preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['c']);
+    echo "--- CANAL {$channelId} ---\n";
+    $ffprobe = find_ffprobe();
+    $videos = get_cached_channel_videos($channelId, YT_API_KEY, 50);
+    $n = 0;
+    foreach (($videos['items'] ?? []) as $it) {
+        $v = $it['snippet']['resourceId']['videoId'] ?? null;
+        $title = $it['snippet']['title'] ?? '';
+        if (!$v) continue;
+        $n++;
+        $f = loop_cache_file($v);
+        $status = 'sem arquivo';
+        $dims = '';
+        if (is_file($f)) {
+            $sz = @filesize($f);
+            $status = $sz > 1000000 ? round($sz / 1048576, 1) . ' MB' : 'incompleto';
+            if ($ffprobe) {
+                $cmd = escapeshellarg($ffprobe) . ' -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 ' . escapeshellarg($f) . ' 2>/dev/null';
+                $o = $rc = null;
+                @exec($cmd, $o, $rc);
+                if ($rc === 0 && !empty($o)) $dims = trim($o[0] ?? '');
+            }
+        }
+        echo str_pad($v, 12) . ' ' . str_pad($status, 14) . ' ' . str_pad($dims, 10) . ' ' . substr($title, 0, 45) . "\n";
+    }
+    echo "videos: {$n}\n";
+    echo "ffprobe: " . ($ffprobe ?: '(nao encontrado)') . "\n";
+    exit;
+}
+
 $id = isset($_GET['id']) ? preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['id']) : '';
 if (!$id) { echo "Faltou ?id=ID\n"; exit; }
 

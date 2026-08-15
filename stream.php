@@ -139,9 +139,9 @@ if ($isIptv) {
     }
     // Sem arquivo local: baixa em linha (rápido no VPS, datacenter a
     // datacenter) e serve o arquivo — bem mais estável que a URL direta do
-    // YouTube (403/throttle). Só se o download não completar a tempo, tenta
-    // tocar pela URL direta (melhor esforço) em vez de devolver 503.
-    if (wait_loop_download($id, 20)) {
+    // YouTube (403/throttle). Espera no máximo ~12s (timeout dos painéis);
+    // se não completar, tenta tocar pela URL direta (melhor esforço).
+    if (wait_loop_download($id, 12)) {
         $localFile = loop_cache_file($id);
         if ($ffmpeg) {
             log_stream("id={$id} IPTV: baixado em linha, servindo {$localFile}");
@@ -323,8 +323,21 @@ function stream_pipe_to_client($proc, string $label): void {
 }
 
 /**
- * Modo CANAL: toca todos os vídeos do canal em sequência (concat), repetindo.
- * Baixa em background os que ainda não têm arquivo local e concatena os prontos.
+ * Lê as dimensões do vídeo de um arquivo local (via ffprobe), ou null.
+ */
+function ffprobe_dims(string $ffprobe, string $file): ?array {
+    $cmd = escapeshellarg($ffprobe) . ' -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 ' . escapeshellarg($file) . ' 2>/dev/null';
+    $o = $rc = null;
+    @exec($cmd, $o, $rc);
+    if ($rc !== 0 || empty($o) || !preg_match('/(\d+)x(\d+)/', trim($o[0] ?? ''), $m)) return null;
+    return [(int)$m[1], (int)$m[2]];
+}
+
+/**
+ * Modo CANAL: toca os vídeos do canal em sequência (concat), repetindo.
+ * Baixa o 1º em linha para começar com arquivo real, baixa os demais em
+ * background e concatena (com re-encode) os prontos que são paisagem — os
+ * portrait esticam no painel e ficam de fora.
  */
 function serve_channel_ts(string $ffmpeg, string $channelId): void {
     $videos = get_cached_channel_videos($channelId, YT_API_KEY, 50);
@@ -347,19 +360,8 @@ function serve_channel_ts(string $ffmpeg, string $channelId): void {
         return;
     }
 
-    // Garante downloads (background) e monta a lista concat só com prontos.
-    $ready = [];
-    foreach ($ids as $v) {
-        $f = loop_cache_file($v);
-        if (is_file($f) && @filesize($f) > 1000000) {
-            $ready[] = $f;
-        } else {
-            ensure_loop_download($v);
-        }
-    }
-
-    if (empty($ready)) {
-        // Nada baixado ainda: toca o primeiro pela URL direta (melhor esforço).
+    // Garante que o primeiro vídeo esteja baixado para começar com arquivo real.
+    if (!wait_loop_download($ids[0], 20)) {
         $u = resolve_stream_url($ids[0], 20);
         if (!$u) {
             http_response_code(503);
@@ -367,8 +369,47 @@ function serve_channel_ts(string $ffmpeg, string $channelId): void {
             echo "Sem conteudo pronto ainda.";
             return;
         }
-        log_stream("ch={$channelId}: nada baixado, tocando direto {$ids[0]}");
+        log_stream("ch={$channelId}: 1o video nao baixou, tocando direto {$ids[0]}");
         serve_via_ffmpeg($ffmpeg, $u, $ids[0]);
+        return;
+    }
+
+    // Dispara downloads em background dos demais.
+    foreach ($ids as $v) {
+        $f = loop_cache_file($v);
+        if (!is_file($f) || @filesize($f) <= 1000000) ensure_loop_download($v);
+    }
+
+    $ffprobe = find_ffprobe();
+
+    // Agrupa arquivos prontos por dimensões (paisagem apenas); o concat exige
+    // parâmetros compatíveis, então usa o maior grupo igual para avançar.
+    $groups = [];
+    foreach ($ids as $v) {
+        $f = loop_cache_file($v);
+        if (!is_file($f) || @filesize($f) <= 1000000) continue;
+        if ($ffprobe) {
+            $d = ffprobe_dims($ffprobe, $f);
+            if ($d === null) continue;
+            if ($d[0] < $d[1]) {
+                log_stream("ch={$channelId}: pulando {$v} (portrait {$d[0]}x{$d[1]})");
+                continue;
+            }
+            $key = "{$d[0]}x{$d[1]}";
+        } else {
+            $key = 'x';
+        }
+        $groups[$key][] = $f;
+    }
+    $ready = [];
+    foreach ($groups as $g) {
+        if (count($g) > count($ready)) $ready = $g;
+    }
+
+    if (empty($ready)) {
+        http_response_code(503);
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Sem conteudo pronto ainda.";
         return;
     }
 
@@ -379,23 +420,26 @@ function serve_channel_ts(string $ffmpeg, string $channelId): void {
     }
     @file_put_contents($listFile, $lines);
     log_stream("ch={$channelId}: servindo concat de " . count($ready) . " vídeos");
-
     serve_via_concat($ffmpeg, $listFile, $channelId);
 }
 
 /**
  * Streama uma lista de arquivos locais em sequência (concat demuxer), em loop,
- * remuxando para MPEG-TS.
+ * RE-ENCODANDO para MPEG-TS. O re-encode normaliza resolução/codecs/áudio de
+ * arquivos diferentes, então o concat sempre avança (com -c copy arquivos com
+ * parâmetros distintos quebrariam a transição).
  */
 function serve_via_concat(string $ffmpeg, string $listFile, string $channelId): void {
     set_time_limit(0);
     @ini_set('output_buffering', '0');
 
+    $enc = ' -c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p -c:a aac -b:a 128k -ar 44100';
+
     // Validação rápida: o concat demuxer abre a lista? Se falhar, tenta tocar
     // o primeiro arquivo da lista isolado (remux simples).
     $testCmd = escapeshellarg($ffmpeg)
          . ' -y -hide_banner -loglevel error -t 1 -f concat -safe 0 -i ' . escapeshellarg($listFile)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb - 2>/dev/null | wc -c';
+         . $enc . ' -f mpegts - 2>/dev/null | wc -c';
     $o = $rc = null;
     @exec($testCmd, $o, $rc);
     $nbytes = (int)trim($o[0] ?? '');
@@ -424,10 +468,10 @@ function serve_via_concat(string $ffmpeg, string $listFile, string $channelId): 
          . ' -y -hide_banner -loglevel error -fflags +genpts'
          . ' -analyzeduration 500000 -probesize 500000'
          . ' -stream_loop -1 -f concat -safe 0 -i ' . escapeshellarg($listFile)
-         . ' -c copy -f mpegts -bsf:v h264_mp4toannexb'
-         . ' pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $channelId . '.log');
+         . $enc
+         . ' -f mpegts pipe:1 2>' . escapeshellarg(CACHE_DIR . '/ffmpeg_' . $channelId . '.log');
 
-    log_stream("ch={$channelId}: iniciando ffmpeg concat (loop) para MPEG-TS");
+    log_stream("ch={$channelId}: iniciando ffmpeg concat (re-encode, loop) para MPEG-TS");
 
     $proc = popen($cmd, 'rb');
     if (!$proc) {
