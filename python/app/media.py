@@ -1,11 +1,13 @@
 """Loop cache (yt-dlp) + ffmpeg: download em segundo plano, remux para MPEG-TS,
-concat do modo canal e resolucao de URL direta."""
+HLS (.m3u8 com segmentos), concat do modo canal e resolucao de URL direta."""
 from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,14 @@ from .config import (
     CREATE_NO_WINDOW,
     FFMPEG,
     FFPROBE,
+    HLS_DIR,
+    HLS_IDLE_SECONDS,
+    HLS_LIST_SIZE,
+    HLS_MAX_CACHE_MB,
+    HLS_MAX_SESSIONS,
+    HLS_PRESET,
+    HLS_TIME,
+    HLS_VOD_MAX_AGE,
     LOOP_MAX_AGE,
     MAX_CONCURRENT_DOWNLOADS,
     UA_DESKTOP,
@@ -504,3 +514,354 @@ def disk_free_mb() -> float:
         except OSError:
             pass
     return total / 1_048_576
+
+
+# ================================================================== HLS (.m3u8)
+#
+# Por que segmentar em vez de mandar o MPEG-TS: o painel/player recebe uma
+# playlist .m3u8 e puxa pedacinhos (segundos). Isso da seek (avancar pular
+# trecho), para/recomeca sem recarregar tudo e nunca fica "sem sinal" num
+# video longo. O ffmpeg e quem produz os segmentos no disco.
+#
+# Dois tipos de sessao:
+#   - VOD  (video solto / item de canal): playlist completa, cresce e termina
+#           com #EXT-X-ENDLIST -> o player pode andar em qualquer ponto.
+#   - LIVE (transmissao ao vivo / modo canal): janela deslizante com
+#           delete_segments -> disco limitado e o player acompanha a borda ao vivo.
+
+_SESS_LOCK = threading.Lock()
+_SESS: dict[str, dict[str, Any]] = {}  # chave -> {proc, kind, last_seen, dir}
+# Um segmento so ja basta para o player comecar (ele recarrega a playlist e
+# pega o resto). Esperar 2 custava ~4s a mais de encode na primeira vez.
+_SEG_MIN_READY = 1
+
+
+def hls_key(video_id: str = "", channel_id: str = "") -> str:
+    """Chave unica por fluxo: 'v<video>' ou 'c<canal>' (serve de nome de pasta)."""
+    if channel_id:
+        return "c" + clean_id(channel_id)
+    return "v" + clean_id(video_id)
+
+
+def hls_dir(key: str, create: bool = False) -> Path:
+    d = HLS_DIR / key
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def hls_playlist(key: str) -> Path:
+    return HLS_DIR / key / "index.m3u8"
+
+
+def _read_text(path: Path, attempts: int = 8, delay: float = 0.15) -> str:
+    """Le um texto do disco tolerando a janela em que o ffmpeg esta escrevendo.
+
+    No Windows o ffmpeg abre a playlist sem compartilhamento de leitura: entre uma
+    atualizacao e outra o arquivo fica bloqueado e a leitura da PermissionError.
+    Nao e erro de verdade, e so o instante da reescrita -- por isso a repeticao."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except PermissionError as e:  # ffmpeg reescrevendo agora
+            last = e
+            time.sleep(delay)
+        except FileNotFoundError:
+            return ""
+        except OSError as e:
+            last = e
+            time.sleep(delay)
+    if last:
+        log(f"nao consegui ler {path.name}: {last}")
+        return ""
+    return ""
+
+
+def hls_is_complete(key: str) -> bool:
+    p = hls_playlist(key)
+    return "#EXT-X-ENDLIST" in _read_text(p)
+
+
+def hls_segment_count(key: str) -> int:
+    try:
+        return sum(1 for _ in (HLS_DIR / key).glob("seg_*.ts"))
+    except OSError:
+        return 0
+
+
+def hls_vod_ready(key: str) -> bool:
+    """Ja existe um VOD completo em disco? (evita re-encodar a cada play)"""
+    p = hls_playlist(key)
+    if not p.is_file() or not hls_is_complete(key):
+        return False
+    try:
+        if time.time() - p.stat().st_mtime > HLS_VOD_MAX_AGE:
+            return False
+    except OSError:
+        return False
+    return hls_segment_count(key) > 0
+
+
+def hls_command(
+    key: str,
+    src: str,
+    live: bool,
+    is_local: bool = True,
+    concat: Path | None = None,
+) -> list[str]:
+    """Comando ffmpeg que gera os segmentos .ts e a playlist index.m3u8.
+
+    Re-encoda sempre (nao da para usar -c copy com -force_key_frames, e sem
+    keyframe no inicio de cada segmento o player sobe atrasado e a seek falha)."""
+    seg = max(2, HLS_TIME)
+    out = hls_dir(key, create=True)
+    args = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+            "-analyzeduration", "2000000", "-probesize", "2000000"]
+    if concat is not None:
+        # modo canal: repete a lista inteira (os videos ficam em sequencia)
+        args += ["-f", "concat", "-safe", "0", "-stream_loop", "-1", "-i", str(concat)]
+    else:
+        if live and is_local:
+            # VOD precisa TERMINAR (ENDLIST) para o player poder andar no video;
+            # so o fluxo continuo e repetido.
+            args += ["-stream_loop", "-1"]
+        args += ["-i", src]
+
+    args += [
+        "-c:v", "libx264", "-preset", HLS_PRESET, "-pix_fmt", "yuv420p",
+        "-force_key_frames", f"expr:gte(t,n_forced*{seg})",
+        "-c:a", "aac", "-ar", "44100", "-ac", "2",
+        "-f", "hls", "-hls_time", str(seg),
+        "-hls_flags", "independent_segments+temp_file",
+        "-hls_segment_filename", str(out / "seg_%05d.ts"),
+    ]
+    if live:
+        args += ["-hls_list_size", str(HLS_LIST_SIZE),
+                 "-hls_flags", "independent_segments+temp_file+delete_segments+omit_endlist"]
+    else:
+        # hls_list_size 0 = playlist com TODOS os segmentos. O padrao do ffmpeg e
+        # 5 (!): a playlist do VOD guardava so os ultimos 5 e o seek nao tinha
+        # para onde ir -- era o que impedia pular trecho no painel.
+        args += ["-hls_list_size", "0"]
+    # NAO usamos -hls_playlist_type vod: com ela o ffmpeg so grava a playlist no
+    # fim do encode (testado no ffmpeg 8.0) e o painel levaria 503 ate la. Sem
+    # essa flag a playlist cresce segmento a segmento (o player ja comeca a
+    # tocar) e o ffmpeg acrescenta o #EXT-X-ENDLIST quando acaba -> seek total.
+    args.append(str(out / "index.m3u8"))
+    return args
+
+
+def _kill(proc: subprocess.Popen | None) -> None:
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.kill()
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+def hls_stop(key: str, remove_dir: bool = True) -> None:
+    """Encerra a sessao e (opcionalmente) apaga os segmentos."""
+    with _SESS_LOCK:
+        s = _SESS.pop(key, None)
+    if s:
+        _kill(s["proc"])
+    if remove_dir:
+        shutil.rmtree(hls_dir(key), ignore_errors=True)
+
+
+def hls_running(key: str) -> bool:
+    with _SESS_LOCK:
+        s = _SESS.get(key)
+        if not s:
+            return False
+        if s["proc"].poll() is not None:
+            _SESS.pop(key, None)
+            return False
+        return True
+
+
+def hls_touch(key: str) -> None:
+    """Marca a sessao como 'alguem esta assistindo' (o reaper nao mata)."""
+    with _SESS_LOCK:
+        s = _SESS.get(key)
+        if s is not None and s["proc"].poll() is None:
+            s["last_seen"] = time.monotonic()
+
+
+def hls_start(
+    key: str,
+    src: str,
+    live: bool,
+    is_local: bool = True,
+    concat: Path | None = None,
+    logpath: Path | None = None,
+) -> tuple[bool, str]:
+    """Garante um ffmpeg gerando segmentos para `key`.
+
+    Devolve (ok, motivo). Reaproveita a sessao que ja estiver rodando."""
+    with _SESS_LOCK:
+        s = _SESS.get(key)
+        if s and s["proc"].poll() is None:
+            s["last_seen"] = time.monotonic()
+            return True, "reaproveitado"
+        if s:
+            _SESS.pop(key, None)
+        running = sum(1 for x in _SESS.values() if x["proc"].poll() is None)
+        if running >= HLS_MAX_SESSIONS:
+            return False, (f"limite de {HLS_MAX_SESSIONS} transmissoes HLS simultaneas; "
+                           f"feche um player e tente de novo")
+
+    # fluxo vivo nao reaproveita: a pasta e zerada para o ffmpeg recomecar limpo
+    if live:
+        shutil.rmtree(hls_dir(key), ignore_errors=True)
+    hls_dir(key, create=True)
+
+    args = hls_command(key, src, live, is_local, concat)
+    fh = None
+    try:
+        if logpath:
+            fh = open(logpath, "a", buffering=1, encoding="utf-8", errors="replace")
+            fh.write(f"\n{time.strftime('%c')} HLS {'live' if live else 'vod'} {key}: {' '.join(args)}\n")
+        proc = subprocess.Popen(
+            args, stdout=subprocess.DEVNULL, stderr=(fh or subprocess.DEVNULL),
+            stdin=subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        if fh:
+            fh.close()
+        log(f"ffmpeg nao encontrado: {FFMPEG}")
+        return False, "ffmpeg nao encontrado no servidor"
+    except Exception as e:
+        if fh:
+            fh.close()
+        return False, f"nao consegui iniciar o ffmpeg: {e}"
+
+    with _SESS_LOCK:
+        _SESS[key] = {"proc": proc, "kind": "live" if live else "vod",
+                      "last_seen": time.monotonic(), "fh": fh, "dir": hls_dir(key)}
+    log(f"hls: sessao {'live' if live else 'vod'} iniciada em {key}")
+    return True, "iniciada"
+
+
+def hls_wait_ready(key: str, max_seconds: float) -> bool:
+    """Espera a playlist aparecer e ganhar alguns segmentos.
+
+    Sem isso o painel receberia uma .m3u8 vazia/inexistente e marcaria
+    'sem sinal' enquanto o ffmpeg ainda nem gravou o primeiro pedaco."""
+    deadline = time.monotonic() + max(0.0, max_seconds)
+    while True:
+        pl = hls_playlist(key)
+        if pl.is_file() and hls_segment_count(key) >= _SEG_MIN_READY:
+            return True
+        if not hls_running(key) and not pl.is_file():
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.4)
+
+
+def read_playlist(key: str, base: str) -> str:
+    """Le a index.m3u8 e reescreve os segmentos para URL ABSOLUTA.
+
+    Necessario porque o ffmpeg grava nomes relativos (seg_00001.ts): servindo a
+    playlist em /stream.php/ID.m3u8, o player procuraria /stream.php/seg_00001.ts
+    e receberia 404."""
+    text = _read_text(hls_playlist(key))
+    out: list[str] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            out.append(line)
+        else:
+            out.append(f"{base}/hls/{key}/{s}")
+    return "\n".join(out) + "\n"
+
+
+def hls_dir_mb(key: str) -> float:
+    total = 0
+    for p in hls_dir(key).glob("*"):
+        try:
+            total += p.stat().st_size
+        except OSError:
+            pass
+    return total / 1_048_576
+
+
+def _prune_hls_cache(keep: set[str]) -> None:
+    """Mantem o cache de segmentos abaixo do teto, apagando o mais antigo."""
+    dirs: list[tuple[float, str]] = []
+    total = 0.0
+    try:
+        kids = list(HLS_DIR.iterdir())
+    except OSError:
+        return
+    for d in kids:
+        if not d.is_dir() or d.name in keep:
+            continue
+        mb = hls_dir_mb(d.name)
+        total += mb
+        try:
+            dirs.append((d.stat().st_mtime, d.name))
+        except OSError:
+            pass
+    if total <= HLS_MAX_CACHE_MB:
+        return
+    for _, name in sorted(dirs):  # mais antigo primeiro
+        if total <= HLS_MAX_CACHE_MB:
+            break
+        mb = hls_dir_mb(name)
+        shutil.rmtree(HLS_DIR / name, ignore_errors=True)
+        total -= mb
+        log(f"hls: cache cheio, apagando segmentos de {name} ({mb:.0f} MB)")
+
+
+def reap_hls() -> dict[str, Any]:
+    """Rotina periodica: mata fluxo sem ninguem assistindo e limpa disco."""
+    now = time.monotonic()
+    mortos: list[str] = []
+    with _SESS_LOCK:
+        for key in list(_SESS):
+            s = _SESS[key]
+            if s["proc"].poll() is not None:
+                # VOD terminou sozinho (chegou no ENDLIST)
+                _SESS.pop(key, None)
+                fh = s.get("fh")
+                if fh:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                if s["kind"] == "live":
+                    shutil.rmtree(hls_dir(key), ignore_errors=True)
+                continue
+            if now - s["last_seen"] > HLS_IDLE_SECONDS:
+                _kill(s["proc"])
+                _SESS.pop(key, None)
+                fh = s.get("fh")
+                if fh:
+                    try:
+                        fh.close()
+                    except Exception:
+                        pass
+                if s["kind"] == "live":
+                    shutil.rmtree(hls_dir(key), ignore_errors=True)
+                mortos.append(key)
+    if mortos:
+        log(f"hls: {len(mortos)} transmissao(oes) sem audiencia encerrada(s)")
+    with _SESS_LOCK:
+        vivos = [k for k, v in _SESS.items() if v["proc"].poll() is None]
+    _prune_hls_cache(set(vivos))
+    return {"ativos": len(vivos), "encerrados": len(mortos)}
+
+
+def hls_status() -> list[dict[str, Any]]:
+    with _SESS_LOCK:
+        itens = [
+            {"key": k, "tipo": v["kind"], "mb": round(hls_dir_mb(k), 1),
+             "segmentos": hls_segment_count(k), "completo": hls_is_complete(k)}
+            for k, v in _SESS.items() if v["proc"].poll() is None
+        ]
+    return sorted(itens, key=lambda x: x["key"])
