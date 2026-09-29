@@ -1,0 +1,11 @@
+# nunca versionar segredos / dados
+.env
+app.db
+app.db-wal
+app.db-shm
+cache/
+__pycache__/
+*.pyc
+*.log
+smoke_*.bin
+cookies.txt
