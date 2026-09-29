@@ -91,8 +91,13 @@ ok("  marcador VOD", f"{n_vod}/{n_inf} itens")
 if n_vod != n_inf:
     fail("  TODO item de video deveria ter vod=1", f"{n_vod}/{n_inf}")
 
-pl_c = check("modo canal", f"/lista.php?u={u}&t={t}&modo=canal", [f"/stream.php/c-{CHANNEL}.ts"], ['vod="1"'])
+pl_c = check("modo canal", f"/lista.php?u={u}&t={t}&modo=canal", [f"/stream.php/c-{CHANNEL}.m3u8"], ['vod="1"'])
 ok("  modo canal sem vod", f"{pl_c.count('vod=')} marcadores (esperado 0)")
+
+# o padrao da playlist agora e HLS (.m3u8); ?formato=ts volta ao MPEG-TS
+pl_t = check("modo canal formato=ts", f"/lista.php?u={u}&t={t}&modo=canal&formato=ts", [f"/stream.php/c-{CHANNEL}.ts"], [])
+check("hls na playlist padrao", f"/lista.php?u={u}&t={t}", [".m3u8"], [".ts"])
+ok("  vod aponta para .m3u8", f"{pl.count('.m3u8')} itens")
 
 pl_v = check("vlc", f"/lista.php?u={u}&t={t}&mode=vlc", ["stream.php?id="], [".ts"])
 ok("  vlc sem .ts", f"{pl_v.count('stream.php?id=')} itens")
