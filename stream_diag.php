@@ -36,6 +36,94 @@ if (isset($_GET['c']) && $_GET['c'] !== '') {
     exit;
 }
 
+// ?why=ID: por que um vídeo falhou ("Falha ao resolver o stream do video X").
+// Mostra o estado do download, o log do yt-dlp, as linhas do stream.log
+// daquele ID e roda um teste real de extração (diz se o vídeo está
+// indisponível/privado/precisa de login ou se a extração é que quebrou).
+if (isset($_GET['why']) && $_GET['why'] !== '') {
+    $id = preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['why']);
+    echo "--- POR QUE {$id} ---\n";
+    echo "agora: " . date('c') . "\n";
+
+    // Libera o cache negativo pra o teste de resolução ser real
+    @unlink(CACHE_DIR . '/yt_video_' . $id . '_fail.json');
+
+    $f = loop_cache_file($id);
+    $sz = is_file($f) ? (int)@filesize($f) : 0;
+    echo "\n--- loop cache ---\n";
+    echo "arquivo: " . ($f ?: '(nenhum)') . "\n";
+    echo "tamanho: " . $sz . " bytes" . ($sz > 0 ? ' (' . round($sz / 1048576, 1) . ' MB)' : '') . "\n";
+    echo "valido: " . ($sz > 1000000 ? 'SIM' : 'NAO') . "\n";
+    foreach (['pid', 'fail', 'start'] as $sfx) {
+        $p = CACHE_DIR . '/loop_' . $id . '.' . $sfx;
+        echo "loop_{$id}.{$sfx}: " . (is_file($p) ? trim((string)@file_get_contents($p)) : '(nao existe)') . "\n";
+    }
+    $pidF = CACHE_DIR . '/loop_' . $id . '.pid';
+    $pid = is_file($pidF) ? (int)trim((string)@file_get_contents($pidF)) : 0;
+    echo "download rodando: " . ($pid > 0 ? (process_alive($pid) ? "SIM (pid $pid)" : "nao (pid $pid morto)") : 'nao') . "\n";
+
+    echo "\n--- cache de resolucao ---\n";
+    foreach (['yt_video_' . $id . '.json', 'yt_video_' . $id . '_fail.json'] as $cn) {
+        echo $cn . ": " . (is_file(CACHE_DIR . '/' . $cn) ? trim((string)@file_get_contents(CACHE_DIR . '/' . $cn)) : '(nao existe)') . "\n";
+    }
+
+    $lg = CACHE_DIR . '/loop_' . $id . '.log';
+    echo "\n--- cache/loop_{$id}.log (ultimas 40 linhas) ---\n";
+    if (is_file($lg)) {
+        $lines = @file($lg, FILE_IGNORE_NEW_LINES) ?: [];
+        echo implode("\n", array_slice($lines, -40)) . "\n";
+    } else {
+        echo "(nao existe)\n";
+    }
+
+    $sl = CACHE_DIR . '/stream.log';
+    echo "\n--- cache/stream.log (linhas com {$id}, ultimas 25) ---\n";
+    if (is_file($sl)) {
+        $all = @file($sl, FILE_IGNORE_NEW_LINES) ?: [];
+        $hit = array_values(array_filter($all, function ($l) use ($id) { return strpos($l, $id) !== false; }));
+        echo ($hit ? implode("\n", array_slice($hit, -25)) : '(nenhuma)') . "\n";
+    } else {
+        echo "(nao existe)\n";
+    }
+
+    echo "\n--- teste de extracao yt-dlp ---\n";
+    $prep = ytdlp_prepare(false);
+    echo "prep: " . ($prep ? (($prep['type'] ?? '?') . ' => ' . ($prep['binary'] ?? ($prep['zipapp'] ?? '?'))) : '(nenhum binario)') . "\n";
+    if ($prep) {
+        $ver = null; $vrc = null;
+        @exec(ytdlp_build_cmd($prep, ['--version']), $ver, $vrc);
+        echo "versao: " . trim($ver[0] ?? '(sem saida)') . " (rc={$vrc})\n";
+        $args = ['--no-playlist', '--simulate', '--no-warnings', '--no-check-certificates',
+                 '--print', '%(id)s | dur=%(duration)s | disp=%(availability)s | live=%(live_status)s | %(title).60s'];
+        $args = array_merge($args, yt_cookies_args(), ['https://www.youtube.com/watch?v=' . $id]);
+        $o = null; $rc = null;
+        @exec(ytdlp_build_cmd($prep, $args), $o, $rc);
+        echo "rc={$rc}\n";
+        $out = trim(implode("\n", array_slice($o ?: [], -20)));
+        echo ($out !== '' ? $out : '(sem saida)') . "\n";
+    }
+
+    // oEmbed: sinal independente de disponibilidade (401/404 = privado/removido)
+    echo "\n--- oEmbed (disponibilidade) ---\n";
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => 'https://www.youtube.com/oembed?format=json&url=' . rawurlencode('https://www.youtube.com/watch?v=' . $id),
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT => 6,
+        CURLOPT_CONNECTTIMEOUT => 3,
+    ]);
+    $body = (string)curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    echo "http: {$code}\n";
+    echo substr($body, 0, 400) . "\n";
+    if ($code !== 200) {
+        echo "=> Video provavelmente privado, removido, com restricao de login/idade ou da regiao.\n";
+    }
+    exit;
+}
+
 $id = isset($_GET['id']) ? preg_replace('~[^A-Za-z0-9_-]~', '', $_GET['id']) : '';
 if (!$id) { echo "Faltou ?id=ID\n"; exit; }
 
