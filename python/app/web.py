@@ -767,4 +767,9 @@ async def stream_diag(request: Request, id: str = "", why: str = "", c: str = ""
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "watch": watch.running(), "cache_mb": round(media.disk_free_mb(), 1)}
+    return {
+        "yt": "youtube-iptv",  # marcador: o iniciar.bat usa para saber que a porta
+        "ok": True,            # ja e o nosso app e nao outro programa
+        "watch": watch.running(),
+        "cache_mb": round(media.disk_free_mb(), 1),
+    }
