@@ -70,11 +70,17 @@ def main(argv: list[str]) -> int:
     import uvicorn
 
     os.environ["PORT"] = str(port)
+    # No Windows o ProactorEventLoop (padrao do asyncio) derruba o servidor com
+    # "OSError: [WinError 64] ... Accept failed on a socket" quando um cliente
+    # desconecta de repente -- exatamente o que o painel IPTV faz ao trocar de
+    # canal. SelectorEventLoop nao sofre com isso.
+    loop = "asyncio"
     uvicorn.run(
         "app.web:app",
         host=os.getenv("HOST", "0.0.0.0"),
         port=port,
         log_level=os.getenv("LOG_LEVEL", "info"),
+        loop=loop,
     )
     return 0
 
