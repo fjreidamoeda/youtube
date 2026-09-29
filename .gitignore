@@ -7,7 +7,7 @@ __pycache__/
 bin/
 cache/
 config.php
- app.db
- app.db-*
- cookies.txt
- *.log
+app.db
+app.db-*
+cookies.txt
+*.log
