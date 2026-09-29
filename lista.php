@@ -58,7 +58,9 @@ foreach ($channels as $c) {
     if (!empty($c['video_id'])) {
         // Se for apenas um vídeo solto
         $playUrl = $streamUrl($c['video_id']);
-        echo '#EXTINF:-1 tvg-id="' . $tvgId . '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="' . $group . '",' . $name . "\n";
+        // vod="1" marca o item como VOD (video sob demanda) no cabeçalho.
+        // A live NÃO recebe esse marcador — ela continua sendo canal ao vivo.
+        echo '#EXTINF:-1 vod="1" tvg-id="' . $tvgId . '" tvg-name="' . $name . '" tvg-logo="' . $logo . '" group-title="' . $group . '",' . $name . "\n";
         echo '#EXTGRP:' . $group . "\n";
         echo $playUrl . "\n";
     } elseif (!empty($c['channel_id'])) {
@@ -106,7 +108,9 @@ foreach ($channels as $c) {
                 // Remove vírgulas do título para não quebrar a sintaxe do M3U
                 $vTitleClean = str_replace(',', '', $vTitle);
                 
-                echo '#EXTINF:-1 tvg-id="' . $tvgId . '" tvg-logo="' . $vThumb . '" group-title="' . $group . '",' . $vTitleClean . "\n";
+                // vod="1" no cabeçalho: identifica o item como VOD nos painéis
+                // que separam Live de VOD pela lista M3U.
+                echo '#EXTINF:-1 vod="1" tvg-id="' . $tvgId . '" tvg-logo="' . $vThumb . '" group-title="' . $group . '",' . $vTitleClean . "\n";
                 echo '#EXTGRP:' . $group . "\n";
                 echo $playUrl . "\n";
             }
