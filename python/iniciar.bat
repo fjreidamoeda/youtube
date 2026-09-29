@@ -158,10 +158,14 @@ start "" /b cmd /c "timeout /t 5 >nul & start "" http://localhost:!PORTA!/" >nul
 set "RC=!ERRORLEVEL!"
 
 echo.
-if not "!RC!"=="0" (
-  echo  [ERRO] o servidor terminou com codigo !RC! - veja a mensagem acima.
-) else (
+if "!RC!"=="0" (
   echo  Servidor encerrado.
+) else (
+  echo  [ERRO] o servidor terminou com codigo !RC! - veja as mensagens acima.
+  echo.
+  set "REIN="
+  set /p REIN=  Reiniciar o servidor? ^(s/N^):
+  if /i "!REIN!"=="s" goto :servidor
 )
 echo.
 pause
