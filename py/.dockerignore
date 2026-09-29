@@ -1,9 +1,0 @@
-.env
-app.db*
-cache/
-__pycache__/
-*.log
-smoke_*.bin
-cookies.txt
-.git
-.gitignore
