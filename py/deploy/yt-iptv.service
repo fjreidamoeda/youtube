@@ -1,0 +1,20 @@
+[Unit]
+Description=YouTube IPTV (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ytiptv
+Group=ytiptv
+WorkingDirectory=/srv/yt
+Environment="HOST=0.0.0.0"
+Environment="PORT=8000"
+ExecStart=/usr/bin/python3 /srv/yt/run.py
+Restart=always
+RestartSec=5
+# o cache precisa de espaco: video em cache e o que faz o painel tocar
+ReadWritePaths=/srv/yt/cache /srv/yt
+
+[Install]
+WantedBy=multi-user.target
