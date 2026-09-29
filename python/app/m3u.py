@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import db, youtube
-from .config import YT_API_KEY
+from .config import PLAYLIST_FORMAT, YT_API_KEY
 
 
 def _clean_title(t: str) -> str:
@@ -32,19 +32,30 @@ def build_playlist(
     base: str,
     mode: str = "iptv",
     canal: bool = False,
+    formato: str = "",
 ) -> str:
     """Monta a M3U do usuario.
 
     - videos de canal/videos soltos recebem `vod="1"` no cabecalho (identificam o
       item como VOD); a live e a entrada do modo canal NAO recebem (sao fluxos
       continuos).
-    - URL mantem o sufixo .ts: e o que faz o painel classificar como IPTV.
+    - formato "hls" (padrao): URL .m3u8, o player puxa segmentos e da para
+      pular trecho. "ts": MPEG-TS continuo (o jeito antigo, so para painel que
+      nao aceita .m3u8).
     """
+    ext = (formato or PLAYLIST_FORMAT or "hls").lower()
+    ext = "ts" if ext == "ts" else "m3u8"
+
     lines: list[str] = [
         f'#EXTM3U url-tvg="{base}/epg.php?u={owner["username"]}&t={owner["token"]}"'
     ]
     if not YT_API_KEY:
         lines.append("# [AVISO] YT_API_KEY nao configurada: nenhum video sera listado.")
+
+    def stream_url(vid: str) -> str:
+        if mode == "vlc":
+            return f"{base}/stream.php?id={vid}"
+        return f"{base}/stream.php/{vid}.{ext}"
 
     for c in db.channels_for_user(int(owner["id"])):
         name = c.get("name") or "YouTube"
@@ -68,8 +79,7 @@ def build_playlist(
 
         if c.get("video_id"):
             vid = c["video_id"]
-            url = f"{base}/stream.php?id={vid}" if mode == "vlc" else f"{base}/stream.php/{vid}.ts"
-            entry(name, url, vod=True, tvg_logo=logo, tvg_name=name)
+            entry(name, stream_url(vid), vod=True, tvg_logo=logo, tvg_name=name)
             continue
 
         channel_id = c.get("channel_id") or ""
@@ -77,13 +87,13 @@ def build_playlist(
             continue
 
         if canal:
-            entry(name, f"{base}/stream.php/c-{channel_id}.ts", vod=False, tvg_logo=logo, tvg_name=name)
+            entry(name, f"{base}/stream.php/c-{channel_id}.{ext}", vod=False, tvg_logo=logo, tvg_name=name)
             continue
 
         limit = max(1, min(500, int(c.get("max_videos", 50) or 50)))
         live_id = youtube.live_video_id(channel_id)
         if live_id:
-            entry(f"[AO VIVO] {name}", f"{base}/stream.php/{live_id}.ts", vod=False, tvg_logo=logo,
+            entry(f"[AO VIVO] {name}", stream_url(live_id), vod=False, tvg_logo=logo,
                   tvg_name=f"[AO VIVO] {name}")
 
         data = youtube.cached_channel_videos(channel_id, limit)
@@ -94,8 +104,7 @@ def build_playlist(
             vid = it.get("id") or ""
             if not vid or vid == live_id:
                 continue
-            url = f"{base}/stream.php?id={vid}" if mode == "vlc" else f"{base}/stream.php/{vid}.ts"
-            entry(it.get("title", ""), url, vod=True, tvg_logo=it.get("thumb") or logo)
+            entry(it.get("title", ""), stream_url(vid), vod=True, tvg_logo=it.get("thumb") or logo)
 
     return "\n".join(lines) + "\n"
 
