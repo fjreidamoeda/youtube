@@ -80,6 +80,19 @@ VLC_WAIT_SECONDS = _int("VLC_WAIT_SECONDS", 20)
 CHANNEL_WAIT_SECONDS = _int("CHANNEL_WAIT_SECONDS", 25)
 WATCH_INTERVAL = _int("WATCH_INTERVAL", 240)
 
+# ---- HLS (.m3u8 com segmentos) ----------------------------------------
+# "hls" = playlist .m3u8 (padrao); "ts" = MPEG-TS continuo como estava antes.
+PLAYLIST_FORMAT = os.getenv("PLAYLIST_FORMAT", "hls").strip().lower()
+HLS_TIME = max(2, _int("HLS_TIME", 4))            # duracao de cada segmento
+HLS_LIST_SIZE = max(4, _int("HLS_LIST_SIZE", 30))  # segmentos na janela (live/canal)
+HLS_PRESET = os.getenv("HLS_PRESET", "veryfast").strip() or "veryfast"
+HLS_FIRST_WAIT = _int("HLS_FIRST_WAIT", 25)  # espera o 1o segmento antes de responder
+HLS_IDLE_SECONDS = _int("HLS_IDLE_SECONDS", 150)  # mata o ffmpeg sem nenhum leitor
+HLS_MAX_SESSIONS = max(1, _int("HLS_MAX_SESSIONS", 4))
+HLS_MAX_CACHE_MB = _int("HLS_MAX_CACHE_MB", 6000)  # teto dos segmentos em disco
+HLS_VOD_MAX_AGE = _int("HLS_VOD_MAX_AGE", 24 * 3600)  # refaz o VOD depois disso
+HLS_DIR = CACHE_DIR / "hls"
+
 YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
 UA_DESKTOP = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
