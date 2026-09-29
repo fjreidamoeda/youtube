@@ -18,7 +18,14 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 from . import config, db, m3u, media, ui, watch, youtube
 from .config import CACHE_DIR, YT_API_KEY, clean_id, log, video_id_ok
@@ -32,13 +39,28 @@ async def lifespan(_app: FastAPI):
         print(f"[yt-iptv] usuario admin criado | senha: {pwd}  (troque depois)", flush=True)
     # o monitor roda em uma thread solta e nao bloqueia o startup
     watch.start()
+    # varredura dos fluxos HLS: encerra o que ninguem esta assistindo
+    reaper = asyncio.create_task(_hls_reaper())
     print(
         f"[yt-iptv] cache={CACHE_DIR} | ffmpeg={config.FFMPEG} | yt-dlp={config.YTDLP} | "
-        f"base_url={config.BASE_URL or '(do request)'}",
+        f"base_url={config.BASE_URL or '(do request)'} | playlist={config.PLAYLIST_FORMAT.upper()}",
         flush=True,
     )
     yield
+    reaper.cancel()
     watch.stop()
+
+
+async def _hls_reaper() -> None:
+    """Passa a cada 20s: mata ffmpeg de HLS sem audiencia e limita o cache."""
+    while True:
+        try:
+            await asyncio.sleep(20)
+            await asyncio.to_thread(media.reap_hls)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # nunca derruba o servidor por causa da limpeza
+            log(f"hls reaper: {e}")
 
 
 app = FastAPI(title="YouTube IPTV", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -396,11 +418,12 @@ def _playlist_owner(u: str, t: str) -> dict[str, Any] | None:
 
 @app.get("/lista.php")
 @app.get("/lista.m3u")
-async def lista(request: Request, u: str = "", t: str = "", modo: str = "", mode: str = "iptv", download: str = ""):
+async def lista(request: Request, u: str = "", t: str = "", modo: str = "", mode: str = "iptv",
+                download: str = "", formato: str = ""):
     owner = _playlist_owner(u, t)
     if not owner:
         return PlainTextResponse("Acesso negado: token de playlist invalido ou usuario nao ativo.", status_code=403)
-    body = m3u.build_playlist(owner, base_url(request), mode=mode, canal=(modo == "canal"))
+    body = m3u.build_playlist(owner, base_url(request), mode=mode, canal=(modo == "canal"), formato=formato)
     if any(c.get("download") for c in db.channels_for_user(int(owner["id"]))):
         _trigger_watch()
     headers = {"Content-Type": "application/x-mpegURL; charset=utf-8"}
@@ -421,7 +444,7 @@ async def epg(request: Request, u: str = "", t: str = ""):
 # ------------------------------------------------------------------ streaming
 
 def is_iptv_request(request: Request) -> bool:
-    """Mesma classificacao do PHP: HEAD, ?iptv=1, ?xui=1, UA de painel ou URL .ts."""
+    """Mesma classificacao do PHP: HEAD, ?iptv=1, ?xui=1, UA de painel ou URL .ts/.m3u8."""
     if request.method == "HEAD":
         return True
     q = request.query_params
@@ -430,7 +453,7 @@ def is_iptv_request(request: Request) -> bool:
     ua = (request.headers.get("user-agent") or "").lower()
     if any(k in ua for k in ("xtream", "xui", "stalker", "exoplayer", "tvg", "kodi")):
         return True
-    if request.url.path.endswith(".ts"):
+    if request.url.path.endswith((".ts", ".m3u8")):
         return True
     return False
 
@@ -543,21 +566,24 @@ def file_response(path: Path, request: Request, media_type: str) -> Response:
 
 async def serve_channel_ts(channel_id: str, request: Request) -> Response:
     """Modo canal: toca todos os videos do canal em sequencia, em MPEG-TS
-    continuo (re-encoding normaliza resolucao/codec e garante a transicao)."""
+    continuo (re-encoding normaliza resolucao/codec e garante a transicao).
+
+    As esperas/ffprobe vao em thread: bloqueando o event loop, um painel
+    esperando download pararia o servidor inteiro."""
     limit = 50
-    ch = db.find_channel_anywhere(channel_id)
+    ch = await asyncio.to_thread(db.find_channel_anywhere, channel_id)
     if ch:
         limit = int(ch.get("max_videos", 50) or 50)
-    data = youtube.cached_channel_videos(channel_id, limit)
+    data = await asyncio.to_thread(youtube.cached_channel_videos, channel_id, limit)
     items = [it["id"] for it in data["items"] if video_id_ok(it.get("id", ""))]
 
     # espera o primeiro video ficar pronto (evita "sem sinal" no painel)
     if items:
-        media.ensure_download(items[0])
-        media.wait_download(items[0], config.CHANNEL_WAIT_SECONDS)
+        await asyncio.to_thread(media.ensure_download, items[0])
+        await asyncio.to_thread(media.wait_download, items[0], config.CHANNEL_WAIT_SECONDS)
 
-    files = [p for p in (media.find_loop(v) for v in items[:20]) if p]
-    picked = media.pick_channel_videos(files)
+    found = await asyncio.gather(*(asyncio.to_thread(media.find_loop, v) for v in items[:20]))
+    picked = await asyncio.to_thread(media.pick_channel_videos, [p for p in found if p])
     if not picked:
         return PlainTextResponse(
             "Sem video local para o canal ainda. Abra o gerenciador de downloads "
@@ -569,14 +595,170 @@ async def serve_channel_ts(channel_id: str, request: Request) -> Response:
     return ts_response(proc, fh)
 
 
+# ------------------------------------------------------------------ HLS (.m3u8)
+
+M3U8_TYPE = "application/vnd.apple.mpegurl"
+SEG_RE = re.compile(r"^seg_\d{4,6}\.ts$")
+HLS_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
+
+
+def _hls_playlist(text: str) -> Response:
+    return Response(
+        text,
+        media_type=M3U8_TYPE,
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
+
+
+def _hls_fail(msg: str) -> Response:
+    return PlainTextResponse(msg, media_type="text/plain", status_code=503)
+
+
+def _hls_send(key: str, request: Request) -> Response:
+    """Playlist com URLs absolutas, sem deixar exception virar 500."""
+    try:
+        return _hls_playlist(media.read_playlist(key, base_url(request)))
+    except Exception as e:
+        log(f"hls: falha ao ler a playlist de {key}: {e!r}")
+        return _hls_fail("Nao consegui ler a playlist HLS. Tente de novo em instantes.")
+
+
+@app.api_route("/hls/{key}/{filename}", methods=["GET", "HEAD"])
+async def hls_segment(key: str, filename: str, request: Request):
+    """Segmento .ts do fluxo HLS.
+
+    O nome passa por regex (nada de '..' ou barra invertida) e o arquivo sai
+    direto do disco: e o que o player pede de poucos em poucos segundos."""
+    if not HLS_KEY_RE.match(key) or not SEG_RE.match(filename):
+        return PlainTextResponse("segmento invalido", media_type="text/plain", status_code=404)
+    path = media.hls_dir(key) / filename
+    if not path.is_file():
+        return PlainTextResponse("segmento ainda nao pronto", media_type="text/plain", status_code=404)
+    # alguem esta assistindo: impede o reaper de derrubar o ffmpeg no meio
+    media.hls_touch(key)
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="video/mp2t",
+                        headers={"Content-Length": str(path.stat().st_size)})
+    return FileResponse(path, media_type="video/mp2t",
+                        headers={"Cache-Control": "public, max-age=30"})
+
+
+async def serve_hls_video(vid: str, request: Request) -> Response:
+    """Um video como HLS: playlist que cresce e termina com ENDLIST.
+
+    Todas as chamadas do media.py sao blocking (espera download, roda ffprobe,
+    resolve URL) e vao para uma thread: se ficassem no event loop, um painel
+    esperando 20s por um download pararia o servidor inteiro."""
+    key = media.hls_key(vid)
+    if await asyncio.to_thread(media.hls_vod_ready, key):
+        await asyncio.to_thread(media.hls_touch, key)
+        return _hls_send(key, request)
+
+    t0 = time.monotonic()
+
+    def mark(etapa: str) -> None:
+        # loga etapa lenta: serve para achar o gargalo quando o painel demora
+        dt = time.monotonic() - t0
+        if dt > 3:
+            log(f"hls: {etapa} levou {dt:.1f}s (id={vid})")
+
+    mark("inicio")
+    local = await asyncio.to_thread(media.find_loop, vid)
+    mark("find_loop")
+    if local:
+        log(f"hls id={vid} a partir do cache {local.name}")
+    else:
+        await asyncio.to_thread(media.ensure_download, vid)
+        await asyncio.to_thread(media.wait_download, vid, config.IPTV_WAIT_SECONDS)
+        local = await asyncio.to_thread(media.find_loop, vid)
+        mark("espera de download")
+
+    if local:
+        src, is_local = str(local), True
+    else:
+        # sem download: encoda direto da URL do YouTube (funciona, so demora)
+        src = await asyncio.to_thread(media.resolve_direct_url, vid)
+        is_local = False
+        mark("resolve_direct_url")
+        if not src:
+            return _hls_fail(
+                f"Nao consegui pegar o video {vid}. Baixe em /dl/v/{vid} e tente de novo."
+            )
+
+    ok, motivo = await asyncio.to_thread(
+        media.hls_start, key, src, False, is_local, None, media.ffmpeg_log(vid)
+    )
+    mark("hls_start")
+    if not ok:
+        return _hls_fail(motivo)
+    pronto = await asyncio.to_thread(media.hls_wait_ready, key, config.HLS_FIRST_WAIT)
+    mark("espera do 1o segmento")
+    if not pronto:
+        return _hls_fail(
+            f"O video {vid} ainda esta sendo preparado para HLS. Tente de novo em instantes "
+            f"(o log esta em cache/ffmpeg_{vid}.log)."
+        )
+    return _hls_send(key, request)
+
+
+async def serve_channel_hls(channel_id: str, request: Request) -> Response:
+    """Modo canal em HLS: janela deslizante, os videos ficam em sequencia e o
+    fluxo nao acaba (o painel ve um 'canal' continuo)."""
+    key = media.hls_key(channel_id=channel_id)
+    await asyncio.to_thread(media.hls_touch, key)
+
+    # caminho rapido: a transmissao deste canal ja esta no ar
+    if await asyncio.to_thread(media.hls_running, key):
+        pl = media.hls_playlist(key)
+        if pl.is_file() and await asyncio.to_thread(media.hls_segment_count, key) >= 2:
+            return _hls_send(key, request)
+
+    limit = 50
+    ch = await asyncio.to_thread(db.find_channel_anywhere, channel_id)
+    if ch:
+        limit = int(ch.get("max_videos", 50) or 50)
+    data = await asyncio.to_thread(youtube.cached_channel_videos, channel_id, limit)
+    items = [it["id"] for it in data["items"] if video_id_ok(it.get("id", ""))]
+
+    if items:
+        await asyncio.to_thread(media.ensure_download, items[0])
+        await asyncio.to_thread(media.wait_download, items[0], config.CHANNEL_WAIT_SECONDS)
+
+    found = await asyncio.gather(*(asyncio.to_thread(media.find_loop, v) for v in items[:20]))
+    files = [p for p in found if p]
+    picked = await asyncio.to_thread(media.pick_channel_videos, files)
+    if not picked:
+        return _hls_fail(
+            "Sem video local do canal ainda. Abra o gerenciador de downloads "
+            "(/dl/CHANNELID), baixe os videos e tente de novo."
+        )
+    concat = await asyncio.to_thread(media.write_concat_list, channel_id, picked)
+    ok, motivo = await asyncio.to_thread(
+        media.hls_start, key, "", True, True, concat, CACHE_DIR / f"ffmpeg_c{channel_id}.log"
+    )
+    if not ok:
+        return _hls_fail(motivo)
+    if not await asyncio.to_thread(media.hls_wait_ready, key, config.HLS_FIRST_WAIT):
+        return _hls_fail("O canal ainda esta montando a transmissao. Tente de novo em instantes.")
+    return _hls_send(key, request)
+
+
 @app.api_route("/stream.php", methods=["GET", "HEAD"])
 @app.api_route("/stream.php/{rest:path}", methods=["GET", "HEAD"])
 async def stream(request: Request, rest: str = ""):
     q = request.query_params
     vid = clean_id(q.get("id", ""))
     channel_id = ""
+    want_hls = q.get("hls") == "1"
     name = (rest or "").strip("/")
     if name:
+        if name.lower().endswith(".m3u8"):
+            want_hls = True
+            name = name[: -len(".m3u8")]
         stem = name.rsplit(".", 1)[0] if "." in name else name
         if stem.startswith("c-"):
             channel_id = clean_id(stem[2:])
@@ -586,6 +768,20 @@ async def stream(request: Request, rest: str = ""):
         return PlainTextResponse("Faltou id do video ou canal.", status_code=400)
 
     iptv = is_iptv_request(request)
+
+    # ---- HLS (.m3u8 + segmentos): o formato que o painel IPTV prefere
+    if want_hls:
+        try:
+            if channel_id:
+                return await serve_channel_hls(channel_id, request)
+            if request.method == "HEAD":
+                # probe do painel: responde 200 com o tipo certo da playlist
+                return Response(status_code=200, media_type=M3U8_TYPE)
+            return await serve_hls_video(vid, request)
+        except Exception as e:
+            # painel prefere "sem sinal" (503) a erro 500: ele tenta de novo
+            log(f"hls: erro preparando {vid or channel_id}: {e!r}")
+            return _hls_fail("Erro interno preparando o HLS. Tente de novo em instantes.")
 
     # HEAD: resposta imediata (probe dos painéis Xtream/XUI; 10-15s de timeout)
     if request.method == "HEAD":
@@ -614,15 +810,15 @@ async def stream(request: Request, rest: str = ""):
     if iptv:
         # sem cache: baixa em linha (rapido no VPS) e serve. Limite curto porque
         # o painel da "sem sinal" se demorarmos.
-        if media.wait_download(vid, config.IPTV_WAIT_SECONDS):
-            local = media.find_loop(vid)
+        if await asyncio.to_thread(media.wait_download, vid, config.IPTV_WAIT_SECONDS):
+            local = await asyncio.to_thread(media.find_loop, vid)
             if local:
                 try:
                     proc, fh = media.start_ts_stream(str(local), True, media.ffmpeg_log(vid))
                     return ts_response(proc, fh)
                 except FileNotFoundError:
                     pass
-        url = media.resolve_direct_url(vid)
+        url = await asyncio.to_thread(media.resolve_direct_url, vid)
         if not url:
             return PlainTextResponse(
                 f"Falha ao resolver o stream do video {vid}. "
@@ -636,11 +832,11 @@ async def stream(request: Request, rest: str = ""):
             return await _proxy(url, request)
 
     # VLC / players normais: arquivo local (com seek) ou URL direta via proxy
-    if media.wait_download(vid, config.VLC_WAIT_SECONDS):
-        local = media.find_loop(vid)
+    if await asyncio.to_thread(media.wait_download, vid, config.VLC_WAIT_SECONDS):
+        local = await asyncio.to_thread(media.find_loop, vid)
         if local:
             return file_response(local, request, "video/mp4")
-    url = media.resolve_direct_url(vid)
+    url = await asyncio.to_thread(media.resolve_direct_url, vid)
     if url:
         return await _proxy(url, request)
     return PlainTextResponse(
@@ -684,6 +880,13 @@ async def vercheck():
         f"yt-dlp      : {run([config.YTDLP, '--version'])}",
         f"cookies     : {config.COOKIES_FILE if config.COOKIES_FILE else '(sem cookies)'}",
         f"base_url    : {config.BASE_URL or '(derivado do request)'}",
+        f"formato M3U : {config.PLAYLIST_FORMAT.upper()} (.m3u8=HLS / .ts=MPEG-TS; ?formato=ts troca)",
+        f"HLS         : {config.HLS_DIR} | segmento={config.HLS_TIME}s | "
+        f"janela={config.HLS_LIST_SIZE} | max simultaneas={config.HLS_MAX_SESSIONS}",
+        f"HLS ativas  : " + (
+            ", ".join(f"{s['key']}({s['tipo']},{s['segmentos']}seg,{s['mb']}MB)" for s in media.hls_status())
+            or "nenhuma"
+        ),
         f"monitor     : {'rodando' if watch.running() else 'parado'}",
         f"canais com download continuo: {db.count_downloads_enabled()}",
         f"downloads ativos            : {media.active_downloads()}",
