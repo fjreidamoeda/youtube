@@ -79,6 +79,9 @@ IPTV_WAIT_SECONDS = _int("IPTV_WAIT_SECONDS", 12)
 VLC_WAIT_SECONDS = _int("VLC_WAIT_SECONDS", 20)
 CHANNEL_WAIT_SECONDS = _int("CHANNEL_WAIT_SECONDS", 25)
 WATCH_INTERVAL = _int("WATCH_INTERVAL", 240)
+# Cache com disco cheio trava o yt-dlp e o ffmpeg sem avisar. Abaixo desse
+# minimo (MB) o app para de disparar downloads e avisa no painel.
+DISCO_MINIMO_MB = max(200, _int("DISCO_MINIMO_MB", 1200))
 
 # ---- HLS (.m3u8 com segmentos) ----------------------------------------
 # "hls" = playlist .m3u8 (padrao); "ts" = MPEG-TS continuo como estava antes.
