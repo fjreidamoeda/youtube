@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS channels (
     logo        TEXT NOT NULL DEFAULT '',
     tvg_id      TEXT NOT NULL DEFAULT '',
     max_videos  INTEGER NOT NULL DEFAULT 50,
-    download    INTEGER NOT NULL DEFAULT 0
+    download    INTEGER NOT NULL DEFAULT 0,
+    has_selection INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     token      TEXT PRIMARY KEY,
@@ -39,15 +40,38 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at INTEGER NOT NULL,
     expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS channel_videos (
+    channel_row INTEGER NOT NULL,
+    video_id    TEXT NOT NULL,
+    sel         INTEGER NOT NULL DEFAULT 1,
+    pos         INTEGER NOT NULL DEFAULT 0,
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (channel_row, video_id)
+);
 CREATE INDEX IF NOT EXISTS idx_channels_user ON channels(user_id);
+CREATE INDEX IF NOT EXISTS idx_chvideos ON channel_videos(channel_row);
 """
 
 
+_wal_ok = False  # o modo WAL ja fica gravado no arquivo; so precisa ser pedido 1x
+
+
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
+    global _wal_ok
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=8000;")
+    conn.execute("PRAGMA busy_timeout=10000;")
+    if not _wal_ok:
+        # Trocar o journal_mode precisa de trava exclusiva; com disco saturado
+        # (downloads + ffmpeg escrevendo ao mesmo tempo) isso pode estourar o
+        # timeout e derrubar um request que so queria LEITURA. Como o modo ja
+        # fica persistido no arquivo, e pedida a 1a conexao apenas e, se falhar,
+        # segue em frente (a proxima tentativa refaz).
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            _wal_ok = True
+        except sqlite3.OperationalError:
+            pass
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
@@ -62,6 +86,15 @@ def init_db() -> None:
             conn.execute("ALTER TABLE channels ADD COLUMN max_videos INTEGER NOT NULL DEFAULT 50")
         if "download" not in cols:
             conn.execute("ALTER TABLE channels ADD COLUMN download INTEGER NOT NULL DEFAULT 0")
+        # 0 = o usuario ainda nao escolheu os videos (entra tudo na playlist)
+        # 1 = a escolha vale (inclusive se ele desmarcou tudo)
+        if "has_selection" not in cols:
+            conn.execute("ALTER TABLE channels ADD COLUMN has_selection INTEGER NOT NULL DEFAULT 0")
+        # 'sel' distingue "marcado" de "desmarcado" -- sem ele, um video que o
+        # usuario desmarcou voltaria para a playlist no proximo sync.
+        cvcols = {r["name"] for r in conn.execute("PRAGMA table_info(channel_videos)")}
+        if "sel" not in cvcols:
+            conn.execute("ALTER TABLE channel_videos ADD COLUMN sel INTEGER NOT NULL DEFAULT 1")
         conn.commit()
     finally:
         conn.close()
@@ -276,6 +309,7 @@ def delete_channel(cid: int, uid: int | None = None) -> None:
             conn.execute("DELETE FROM channels WHERE id=?", (cid,))
         else:
             conn.execute("DELETE FROM channels WHERE id=? AND user_id=?", (cid, uid))
+        conn.execute("DELETE FROM channel_videos WHERE channel_row=?", (cid,))
         conn.commit()
     finally:
         conn.close()
@@ -319,5 +353,114 @@ def count_downloads_enabled() -> int:
     conn = get_conn()
     try:
         return int(conn.execute("SELECT COUNT(*) FROM channels WHERE download=1 AND channel_id<>''").fetchone()[0])
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------- videos selecionados do canal
+
+def save_selection(row_id: int, video_ids: list[str], marcar_tudo: bool = False) -> None:
+    """Grava a escolha do usuario (a ordem das caixas = ordem da playlist .m3u8).
+
+    Fica guardada de proposito: o .m3u8 do canal precisa poder ser baixado/
+    aberto em qualquer momento depois, e nao so no instante do clique.
+
+    O que ficou de fora entra com sel=0 -- e o que impede o sync de devolver o
+    video para a playlist. Guardar o "nao" e tao importante quanto o "sim".
+    marcar_tudo=True (botao "baixar TODOS") apaga essa memoria e marca tudo."""
+    conn = get_conn()
+    try:
+        atuais = {
+            r["video_id"]
+            for r in conn.execute("SELECT video_id FROM channel_videos WHERE channel_row=?", (row_id,))
+        }
+        escolhidos = list(dict.fromkeys(video_ids))
+        conn.execute("DELETE FROM channel_videos WHERE channel_row=?", (row_id,))
+        ultimo = len(escolhidos)
+        for pos, vid in enumerate(escolhidos):
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_videos (channel_row, video_id, sel, pos) VALUES (?,?,1,?)",
+                (row_id, vid, pos),
+            )
+        for vid in sorted(atuais - set(escolhidos)):
+            if marcar_tudo:
+                break
+            conn.execute(
+                "INSERT OR IGNORE INTO channel_videos (channel_row, video_id, sel, pos) VALUES (?,?,0,?)",
+                (row_id, vid, ultimo),
+            )
+            ultimo += 1
+        conn.execute("UPDATE channels SET has_selection=1 WHERE id=?", (row_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def sync_selection(row_id: int, video_ids: list[str], has_selection: bool) -> list[str]:
+    """Mantem a selecao em dia com os videos que o canal publica.
+
+    - Video que o usuario ainda nao viu (upload novo) entra marcado, para a
+      playlist do canal ir crescendo sozinha junto com o download continuo.
+    - O que ele desmarcou continua fora (sel=0), mesmo que o sync rode mil vezes.
+    - A ordem escolhida e preservada; os novos vao para o fim.
+    - Se ele nunca escolheu, entra tudo.
+    Devolve a lista de ids marcados, na ordem final."""
+    conn = get_conn()
+    try:
+        gravados = {
+            r["video_id"]: (r["pos"], r["sel"])
+            for r in conn.execute("SELECT video_id, pos, sel FROM channel_videos WHERE channel_row=?", (row_id,))
+        }
+        if not has_selection or not gravados:
+            # primeira vez: tudo marcado, na ordem em que o canal devolveu
+            conn.execute("DELETE FROM channel_videos WHERE channel_row=?", (row_id,))
+            for pos, vid in enumerate(video_ids):
+                conn.execute(
+                    "INSERT OR IGNORE INTO channel_videos (channel_row, video_id, sel, pos) VALUES (?,?,1,?)",
+                    (row_id, vid, pos),
+                )
+            gravados = {vid: (pos, 1) for pos, vid in enumerate(video_ids)}
+        else:
+            ultimo = max((p for p, _ in gravados.values()), default=-1) + 1
+            for vid in video_ids:
+                if vid not in gravados:
+                    gravados[vid] = (ultimo, 1)
+                    ultimo += 1
+                    conn.execute(
+                        "INSERT OR IGNORE INTO channel_videos (channel_row, video_id, sel, pos) VALUES (?,?,1,?)",
+                        (row_id, vid, gravados[vid][0]),
+                    )
+        conn.commit()
+        # some com o que foi apagado do canal, para a playlist nao apontar para video morto
+        valendo = set(video_ids)
+        return [
+            vid
+            for vid, (pos, sel) in sorted(gravados.items(), key=lambda kv: kv[1][0])
+            if sel and vid in valendo
+        ]
+    finally:
+        conn.close()
+
+
+def selection_for(row_id: int) -> list[str]:
+    """Ids marcados do canal, na ordem escolhida (vazio = ainda nao escolheu)."""
+    conn = get_conn()
+    try:
+        return [
+            r["video_id"]
+            for r in conn.execute(
+                "SELECT video_id FROM channel_videos WHERE channel_row=? AND sel=1 ORDER BY pos", (row_id,)
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def clear_selection(row_id: int) -> None:
+    conn = get_conn()
+    try:
+        conn.execute("DELETE FROM channel_videos WHERE channel_row=?", (row_id,))
+        conn.execute("UPDATE channels SET has_selection=0 WHERE id=?", (row_id,))
+        conn.commit()
     finally:
         conn.close()
