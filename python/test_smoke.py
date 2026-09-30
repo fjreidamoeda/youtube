@@ -67,7 +67,11 @@ vids = [l for l in lines if l.startswith("http") and "/stream.php/" in l and "/c
 if not vids:
     fail("playlist sem itens")
     sys.exit(1)
-first = vids[0].rsplit("/", 1)[-1].replace(".ts", "")
+first = vids[0].rsplit("/", 1)[-1]
+for _ext in (".m3u8", ".ts", ".mp4"):
+    if first.endswith(_ext):
+        first = first[: -len(_ext)]
+        break
 ok("header VOD", f"{vod}/{extinf} itens marcados")
 
 # 4) modo canal
