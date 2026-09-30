@@ -18,6 +18,7 @@ from .config import (
     CACHE_DIR,
     COOKIES_FILE,
     CREATE_NO_WINDOW,
+    DISCO_MINIMO_MB,
     FFMPEG,
     FFPROBE,
     HLS_DIR,
@@ -40,6 +41,37 @@ from .config import (
 MIN_BYTES = 1_000_000
 FAIL_BACKOFF = 120  # segundos sem martelar o yt-dlp depois de uma falha
 PARTIAL_MARKS = (".part", ".ytdl", ".temp", ".f_", ".f-")  # download em andamento
+
+
+def disco_livre_mb(path: Path | None = None) -> int:
+    """MB livres no disco do cache (0 se nao der para medir)."""
+    try:
+        alvo = str(path or CACHE_DIR)
+        while alvo and not Path(alvo).exists():
+            alvo = str(Path(alvo).parent)
+        return int(shutil.disk_usage(alvo).free / 1048576)
+    except Exception:
+        return 0
+
+
+def limpa_partidos() -> int:
+    """Apaga .part/.ytdl/.temp orfaos (download morto, app caiu no meio).
+
+    Sem isso eles somam gigabytes para sempre -- foi o que encheu o disco aqui."""
+    n = 0
+    try:
+        for p in CACHE_DIR.rglob("*"):
+            if p.is_file() and any(m in p.name for m in PARTIAL_MARKS):
+                try:
+                    p.unlink()
+                    n += 1
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    if n:
+        log(f"limpeza: {n} arquivo(s) de download incompleto apagado(s)")
+    return n
 
 
 # ------------------------------------------------------------------ caminhos
@@ -170,6 +202,10 @@ def start_download(vid: str) -> bool:
     if download_pid(vid) and process_alive(download_pid(vid)):
         return True
     if fail_file(vid).is_file() and (time.time() - fail_file(vid).stat().st_mtime) < FAIL_BACKOFF:
+        return False
+    if disco_livre_mb() < DISCO_MINIMO_MB:
+        # cache sem espaco: o yt-dlp trava do mesmo jeito, e ainda enche o disco
+        log(f"download {vid} nao iniciado: disco com menos de {DISCO_MINIMO_MB} MB livres")
         return False
 
     target = loop_path(vid)
@@ -456,6 +492,69 @@ def start_channel_ts(channel_id: str, files: list[Path], logpath: Path | None = 
 
 
 # ------------------------------------------------------------------ varios
+
+def purga_cache(alvo_mb: int | None = None, max_apagar: int = 400) -> dict[str, Any]:
+    """Apaga do cache os videos mais antigos ate sobrar espaco.
+
+    O cache cresce sem limite (cada video tem dezenas de MB) e quando enche o
+    disco o yt-dlp trava, o ffmpeg falha e o servidor inteiro fica lento. A
+    purga e por idade de acesso, entao o que o usuario acabou de assistir fica.
+
+    Devolve {'apagados': n, 'mb': x, 'livre_mb': y}."""
+    alvo = alvo_mb if alvo_mb is not None else DISCO_MINIMO_MB * 2
+    apagados = 0
+    gb = 0
+    candidatos: list[tuple[float, Path, int]] = []
+    try:
+        for p in CACHE_DIR.glob("loop_*"):
+            if not p.is_file() or p.suffix == ".log":
+                continue
+            if any(mark in p.name for mark in PARTIAL_MARKS):
+                continue
+            try:
+                st = p.stat()
+                candidatos.append((st.st_mtime, p, st.st_size))
+            except OSError:
+                continue
+    except Exception:
+        pass
+    # mais antigo primeiro
+    candidatos.sort(key=lambda t: t[0])
+    for mtime, p, size in candidatos:
+        if disco_livre_mb() >= alvo or apagados >= max_apagar:
+            break
+        try:
+            p.unlink()
+            apagados += 1
+            gb += size
+        except OSError:
+            continue
+    # o log e o .pid do video deixam de ter sentido
+    limpa_partidos()
+    if apagados:
+        log(f"purga do cache: {apagados} arquivo(s), {gb / 1048576:.0f} MB")
+    return {"apagados": apagados, "mb": round(gb / 1048576, 1), "livre_mb": disco_livre_mb()}
+
+
+def start_many(vids: list[str], max_concurrent: int = MAX_CONCURRENT_DOWNLOADS,
+               espera: float = 0.4) -> int:
+    """Dispara varios downloads em cadencia, respeitando o limite de paralela
+    e o espaco em disco. Roda em thread: a resposta do painel nao espera.
+
+    Sem o espacamento, marcar 50 videos de uma vez abre 50 yt-dlp juntos -- a
+    maquina trava, o disco enche e o pedido HTTP simplesmente nao volta."""
+    iniciada = 0
+    for vid in vids:
+        if active_downloads() >= max_concurrent:
+            break
+        if disco_livre_mb() < DISCO_MINIMO_MB:
+            log(f"start_many: parou em {iniciada}/{len(vids)} (disco cheio)")
+            break
+        if start_download(vid):
+            iniciada += 1
+            time.sleep(espera)
+    return iniciada
+
 
 def ensure_channel_downloads(channel_id: str, max_videos: int = 50) -> list[str]:
     """Garante o download (2o plano) dos videos recentes de um canal."""
