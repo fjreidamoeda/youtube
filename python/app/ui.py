@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import urllib.parse
 from typing import Any
 
 CSS = """
@@ -105,7 +106,8 @@ def login_page(csrf: str, msg: str = "", err: str = "") -> str:
 
 
 def panel_page(user: dict, channels: list[dict], base: str, m3u_url: str, vlc_url: str,
-               canal_url: str, daemon: bool, cache_mb: float) -> str:
+               canal_url: str, daemon: bool, cache_mb: float, livre_mb: float = 0.0,
+               msg: str = "") -> str:
     rows = []
     for c in channels:
         is_vid = bool(c.get("video_id"))
@@ -120,7 +122,9 @@ def panel_page(user: dict, channels: list[dict], base: str, m3u_url: str, vlc_ur
         else:
             tipo = '<span class="tag">Canal Dinamico</span>'
             acoes = (f'<a class="btn btn-outline btn-sm" href="/grade/{esc(c["channel_id"])}">Ver Grade</a>'
-                     f'<a class="btn btn-sm" href="/dl/{esc(c["channel_id"])}">Baixar</a>')
+                     f'<a class="btn btn-sm" href="/dl/{esc(c["channel_id"])}">Baixar</a>'
+                     f'<a class="btn btn-outline btn-sm" href="/canal/{esc(c["channel_id"])}.m3u8?download=1"'
+                     f' title="Playlist .m3u8 deste canal (videos selecionados)">.m3u8</a>')
             qtd = f"""<form method="post" action="/canais/qty" class="row" style="gap:6px">
               <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
               <input type="hidden" name="id" value="{int(c['id'])}">
@@ -161,6 +165,29 @@ def panel_page(user: dict, channels: list[dict], base: str, m3u_url: str, vlc_ur
   </form>
 </div>""".replace("CSRF", esc(user["_csrf"]))
 
+    msg_html = ""
+    if msg:
+        msg_html = (f'<div class="card" style="border-color:var(--primary)">'
+                    f'<strong>{esc(msg)}</strong></div>')
+
+    # o disco cheio trava tudo: avisa e da o botao de limpeza no mesmo lugar
+    if livre_mb < 1200:
+        aviso_espaco = f"""
+  <form method="post" action="/cache/purgar" class="row" style="margin-top:10px">
+    <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
+    <input type="hidden" name="alvo_mb" value="2500">
+    <button class="btn btn-danger">Liberar espaco (apagar videos antigos do cache)</button>
+    <span class="muted">deixa 2,5 GB livres. O que voce assistiu e o que foi baixado
+      ha pouco sao apagados primeiro.</span>
+  </form>"""
+    else:
+        aviso_espaco = f"""
+  <form method="post" action="/cache/purgar" class="row" style="margin-top:10px">
+    <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
+    <input type="hidden" name="alvo_mb" value="2500">
+    <button class="btn btn-outline btn-sm">Liberar espaco no cache</button>
+  </form>"""
+
     links = f"""
 <div class="card">
   <h2>Minhas playlists</h2>
@@ -172,11 +199,13 @@ def panel_page(user: dict, channels: list[dict], base: str, m3u_url: str, vlc_ur
   </table>
   <p class="muted" style="margin-top:10px">
     Monitor de download continuo: <strong>{'rodando' if daemon else 'parado'}</strong> &nbsp;|&nbsp;
-    cache em disco: {cache_mb:.0f} MB
+    cache em disco: {cache_mb:.0f} MB &nbsp;|&nbsp;
+    espaco livre: <strong>{livre_mb:.0f} MB</strong>
   </p>
+  {aviso_espaco}
 </div>"""
 
-    return layout("Painel", tabela + add + links, user)
+    return layout("Painel", (msg_html + tabela + add + links), user)
 
 
 def grid_page(user: dict, channel: dict, videos: list[dict], next_token: str, base: str) -> str:
@@ -209,8 +238,10 @@ def grid_page(user: dict, channel: dict, videos: list[dict], next_token: str, ba
 
 
 def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[str, dict],
-            daemon: bool, is_video: bool = False) -> str:
+            daemon: bool, is_video: bool = False, chosen: set[str] | None = None,
+            base: str = "") -> str:
     titulo = (channel or {}).get("name") or "Video"
+    marcados = chosen if chosen is not None else {v["id"] for v in videos}
     rows = []
     for v in videos:
         st = states.get(v["id"], {})
@@ -222,7 +253,11 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
             tag = '<span class="tag tag-vid">falhou (tentar de novo)</span>'
         else:
             tag = '<span class="tag tag-off">nao baixado</span>'
-        chk = "" if is_video else f'<input type="checkbox" name="ids" value="{esc(v["id"])}" class="dl-check">'
+        if is_video:
+            chk = ""
+        else:
+            mark = " checked" if v["id"] in marcados else ""
+            chk = f'<input type="checkbox" name="ids" value="{esc(v["id"])}" class="dl-check"{mark}>'
         vid = v["id"]
         rows.append(f"""<tr>
 <td>{chk}</td>
@@ -244,13 +279,15 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
     seletor = "" if is_video else f"""
 <div class="card">
   <h2>1. Escolha os videos</h2>
-  <form method="post" action="/dl/start">
+  <p class="muted">O que estiver marcado aqui e o que entra na playlist .m3u8 do canal
+     (card 2). Uploads novos entram marcados sozinhos.</p>
+  <form method="post" action="/dl/select">
     <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
     <input type="hidden" name="canal" value="{esc(canal_id)}">
     <div class="row" style="margin-bottom:12px">
       <label class="row" style="margin:0;gap:6px;cursor:pointer;font-weight:500;color:var(--text)">
         <input type="checkbox" onclick="selTodas(this.checked)" style="width:auto"> Selecionar todos</label>
-      <button class="btn">Baixar selecionados ({len(videos)})</button>
+      <button class="btn">Salvar selecao e baixar ({len(videos)})</button>
     </div>
     <div class="table-wrap"><table>
       <tr><th style="width:28px"></th><th>Video</th><th>Status</th><th>Acoes</th></tr>
@@ -261,12 +298,37 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
     <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
     <input type="hidden" name="canal" value="{esc(canal_id)}">
     <button class="btn btn-outline">Baixar TODOS do canal</button>
+    <span class="muted" style="margin-left:8px">marca tudo e baixa</span>
   </form>
+</div>"""
+
+    # ------------------------------------------------ playlist .m3u8 do canal
+    if is_video or not canal_id:
+        playlist_card = ""
+    else:
+        m3u_url = f"{base}/canal/{canal_id}.m3u8"
+        tok = f"?u={urllib.parse.quote(user['username'])}&amp;t={urllib.parse.quote(user['token'])}"
+        n_sel = sum(1 for v in videos if v["id"] in marcados)
+        playlist_card = f"""
+<div class="card">
+  <h2>2. Playlist do canal (.m3u8)</h2>
+  <p class="muted">Um arquivo so com os <strong>{n_sel}</strong> video(s) marcado(s) acima.
+     Cada linha aponta para o stream HLS deste servidor, entao o painel IPTV e o VLC
+     abrem normal e da para pular trecho.</p>
+  <div class="row" style="margin-top:10px">
+    <a class="btn" href="{esc(m3u_url)}{tok}&amp;download=1">Baixar {esc(titulo[:28])}.m3u8</a>
+    <a class="btn btn-outline" href="{esc(m3u_url)}{tok}" target="_blank">Abrir no navegador</a>
+    <a class="btn btn-outline" href="{esc(m3u_url)}{tok}&amp;formato=ts&amp;download=1">.m3u8 em .ts</a>
+  </div>
+  <p class="muted" style="margin-top:12px">Para cadastrar no painel IPTV (M3U), use esta URL:</p>
+  <div class="mono" style="background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;word-break:break-all">{esc(m3u_url)}{tok}</div>
+  <p class="muted" style="margin-top:8px">Se o painel recusar .m3u8, use o link
+     <span class="mono">.m3u8 em .ts</span> ou acrescente <span class="mono">&amp;formato=ts</span> na URL.</p>
 </div>"""
 
     continuo = "" if is_video else f"""
 <div class="card">
-  <h2>2. Download continuo</h2>
+  <h2>3. Download continuo</h2>
   <p class="muted">Mantem os videos deste canal baixados e baixa os uploads novos sozinho
      (o monitor roda em segundo plano, a pagina pode ficar fechada).</p>
   <form method="post" action="/canais/download" class="row" style="margin-top:10px">
@@ -286,7 +348,7 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
     <a class="btn btn-outline btn-sm" href="/">Voltar</a>
   </div>
 </div>
-{seletor}{continuo}"""
+{seletor}{playlist_card}{continuo}"""
 
     if is_video:
         body += f"""
