@@ -167,7 +167,21 @@ para o HLS `.m3u8`):
 Pode ser aberta no VLC (Vídeos › Abrir fluxo de rede), baixada, ou cadastrada
 como M3U no painel IPTV. A seleção fica salva no banco: **uploads novos entram
 marcados** para a playlist ir crescendo, e **o que você desmarcou continua
-fora**. O botão "Baixar TODOS do canal" também marca todos na playlist.
+fora**. O botão "Marcar tudo e baixar todos os MP4" também marca todos.
+
+### "Baixar MP4" e "Baixar lista" são coisas diferentes
+
+| Botão | O que baixa |
+|---|---|
+| **Baixar MP4 dos marcados** | os **arquivos de vídeo** (`.mp4`) dos marcados, em segundo plano |
+| **Só salvar a seleção** | nada — só grava a escolha para a playlist |
+| **Marcar tudo e baixar todos os MP4** | marca tudo e baixa os vídeos |
+| **Baixar lista `.m3u8`** | **só o arquivo de lista** — um texto pequeno, sem nenhum vídeo dentro |
+| **Baixar lista em `.ts`** | o mesmo arquivo de lista, para painéis que não aceitam `.m3u8` |
+
+Ou seja: os vídeos só saem do servidor pelo botão de MP4. O botão da lista
+baixa o `.m3u8` e pronto — ele **aponta** para os vídeos (que continuam no
+servidor, é por isso que o painel e o VLC tocam normal e dá para pular trecho).
 
 ---
 
