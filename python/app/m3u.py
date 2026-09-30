@@ -109,6 +109,72 @@ def build_playlist(
     return "\n".join(lines) + "\n"
 
 
+def build_channel_playlist(
+    owner: dict[str, Any],
+    base: str,
+    channel: dict[str, Any],
+    items: list[dict[str, Any]],
+    formato: str = "",
+    ao_vivo: bool = False,
+) -> str:
+    """Playlist .m3u8 de UM canal, so com os videos que ele marcou.
+
+    E o mesmo formato da M3U geral (a lista plana #EXTINF + URL e o que os
+    paineis IPTV e o VLC entendem), mas com um arquivo por canal e somente a
+    selecao dele -- pronto para baixar, abrir no VLC ou cadastar no painel.
+
+    - cada video recebe `vod="1"` (sao VOD) e aponta para /stream.php/ID.m3u8;
+    - a live [AO VIVO] entra primeiro, sem vod, so com ao_vivo=True.
+    """
+    ext = (formato or PLAYLIST_FORMAT or "hls").lower()
+    ext = "ts" if ext == "ts" else "m3u8"
+
+    name = channel.get("name") or "YouTube"
+    tvg_id = channel.get("tvg_id") or "yt_" + name[:8]
+    logo = channel.get("logo") or ""
+    grupo = "CANAL | " + name.upper()
+    lines: list[str] = [
+        f'#EXTM3U url-tvg="{base}/epg.php?u={owner["username"]}&t={owner["token"]}"',
+        f"# {name} - {len(items)} video(s) selecionado(s)",
+    ]
+
+    entrou = 0
+
+    def entry(title: str, url: str, vod: bool, thumb: str = "", tvg_name: str = "") -> None:
+        nonlocal entrou
+        t = _clean_title(title)
+        attrs = f'tvg-id="{tvg_id}"'
+        if tvg_name:
+            attrs += f' tvg-name="{_clean_title(tvg_name)}"'
+        if thumb or logo:
+            attrs += f' tvg-logo="{thumb or logo}"'
+        attrs += f' group-title="{grupo}"'
+        if vod:
+            attrs = 'vod="1" ' + attrs
+        lines.append(f"#EXTINF:-1 {attrs},{t}")
+        lines.append(f"#EXTGRP:{grupo}")
+        lines.append(url)
+        entrou += 1
+
+    if ao_vivo:
+        live_id = youtube.live_video_id(channel.get("channel_id") or "")
+        if live_id:
+            entry(f"[AO VIVO] {name}", f"{base}/stream.php/{live_id}.{ext}", vod=False,
+                  tvg_name=f"[AO VIVO] {name}")
+
+    for it in items:
+        vid = it.get("id") or ""
+        if not vid:
+            continue
+        entry(it.get("title") or vid, f"{base}/stream.php/{vid}.{ext}", vod=True,
+              thumb=it.get("thumb") or "")
+
+    if not entrou:
+        lines.append("# [AVISO] Nenhum video neste canal ainda. "
+                     "Marque os videos na tela de downloads do canal.")
+    return "\n".join(lines) + "\n"
+
+
 def build_epg(owner: dict[str, Any], block_hours: int = 6, blocks_ahead: int = 4) -> str:
     """XMLTV basico (blocos 'transmissao continua'), igual ao epg.php."""
     now = datetime.now().astimezone()
