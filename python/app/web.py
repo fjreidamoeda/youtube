@@ -39,13 +39,23 @@ async def lifespan(_app: FastAPI):
         print(f"[yt-iptv] usuario admin criado | senha: {pwd}  (troque depois)", flush=True)
     # o monitor roda em uma thread solta e nao bloqueia o startup
     watch.start()
+    # .part de download morto ocupa GB e enche o disco -- limpa antes de comecar
+    await asyncio.to_thread(media.limpa_partidos)
     # varredura dos fluxos HLS: encerra o que ninguem esta assistindo
     reaper = asyncio.create_task(_hls_reaper())
+    livre = await asyncio.to_thread(media.disco_livre_mb)
     print(
         f"[yt-iptv] cache={CACHE_DIR} | ffmpeg={config.FFMPEG} | yt-dlp={config.YTDLP} | "
-        f"base_url={config.BASE_URL or '(do request)'} | playlist={config.PLAYLIST_FORMAT.upper()}",
+        f"base_url={config.BASE_URL or '(do request)'} | playlist={config.PLAYLIST_FORMAT.upper()} | "
+        f"disco livre={livre} MB",
         flush=True,
     )
+    if livre < media.DISCO_MINIMO_MB:
+        print(
+            f"[yt-iptv] ATENCAO: so {livre} MB livres no disco. Os downloads vao ficar "
+            f"parados ate sobrar {media.DISCO_MINIMO_MB} MB -- apague videos antigos do cache.",
+            flush=True,
+        )
     yield
     reaper.cancel()
     watch.stop()
@@ -197,12 +207,16 @@ async def logout(request: Request):
 # ------------------------------------------------------------------ painel
 
 @app.get("/", response_class=HTMLResponse)
-async def panel(request: Request):
+async def panel(request: Request, livre: str = "", apagados: str = ""):
     user = current_user(request)
     if not user:
         return RedirectResponse("/login", status_code=303)
     base = base_url(request)
     tok = f"u={user['username']}&t={user['token']}"
+    msg = ""
+    if apagados:
+        msg = (f"Cache liberado: {apagados} video(s) apagado(s), agora com "
+               f"{livre or '?'} MB livres no disco.")
     html_out = ui.panel_page(
         user,
         db.channels_for_user(int(user["id"])),
@@ -212,8 +226,27 @@ async def panel(request: Request):
         canal_url=f"{base}/lista.php?{tok}&modo=canal",
         daemon=watch.running(),
         cache_mb=media.disk_free_mb(),
+        livre_mb=await asyncio.to_thread(media.disco_livre_mb),
+        msg=msg,
     )
     return HTMLResponse(html_out)
+
+
+@app.post("/cache/purgar")
+async def cache_purgar(request: Request):
+    """Liberar espaco em disco apagando do cache os videos mais antigos.
+
+    Sem isso o cache cresce ate encher o disco, e ai os downloads param e o
+    ffmpeg falha. Quem chama decide o alvo (MB livres que quer ter)."""
+    user = need_user(request)
+    f = await form(request)
+    check_csrf(f, user)
+    try:
+        alvo = int(one(f, "alvo_mb", "0"))
+    except ValueError:
+        alvo = 0
+    r = await asyncio.to_thread(media.purga_cache, alvo or None)
+    return RedirectResponse(f"/?livre={r['livre_mb']}&apagados={r['apagados']}", status_code=303)
 
 
 @app.post("/canais/add")
@@ -301,6 +334,14 @@ async def grade(channel_id: str, request: Request, pt: str = ""):
 
 # ------------------------------------------------------------------ downloads
 
+def _channel_row(uid: int, channel_id: str) -> dict[str, Any] | None:
+    """Linha do canal (channels.id) de um usuario -- e a chave da selecao."""
+    return next(
+        (c for c in db.channels_for_user(uid) if c.get("channel_id") == channel_id and not c.get("video_id")),
+        None,
+    )
+
+
 @app.get("/dl/{channel_id}", response_class=HTMLResponse)
 async def dl_channel(channel_id: str, request: Request):
     user = need_user(request)
@@ -308,10 +349,18 @@ async def dl_channel(channel_id: str, request: Request):
     ch = next((c for c in db.channels_for_user(int(user["id"])) if c.get("channel_id") == channel_id), None)
     if not ch:
         return RedirectResponse("/", status_code=303)
-    data = youtube.cached_channel_videos(channel_id, int(ch.get("max_videos", 50) or 50))
+    data = await asyncio.to_thread(
+        youtube.cached_channel_videos, channel_id, int(ch.get("max_videos", 50) or 50)
+    )
     items = data["items"]
+    # a escolha das caixas fica guardada no banco: e dela que nasce o .m3u8 do canal
+    escolhidos = set(await asyncio.to_thread(
+        db.sync_selection, int(ch["id"]), [it["id"] for it in items if video_id_ok(it.get("id", ""))],
+        bool(ch.get("has_selection")),
+    ))
     states = {v["id"]: media.download_state(v["id"]) for v in items}
-    return HTMLResponse(ui.dl_page(user, ch, items, states, watch.running()))
+    return HTMLResponse(ui.dl_page(user, ch, items, states, watch.running(),
+                                    chosen=escolhidos, base=base_url(request)))
 
 
 @app.get("/dl/v/{video_id}", response_class=HTMLResponse)
@@ -337,6 +386,28 @@ async def dl_start(request: Request):
     return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
 
 
+@app.post("/dl/select")
+async def dl_select(request: Request):
+    """'Salvar selecao e baixar': grava as caixas marcadas e baixa os videos.
+
+    Salvar e baixar juntos de proposito -- o .m3u8 do canal nasce exatamente das
+    caixas marcadas, e o usuario nao precisa lembrar de salvar antes.
+
+    Os downloads vao para uma thread solta: marcar 50 videos nao pode deixar a
+    pagina esperando (e 50 yt-dlp ao mesmo tempo travaria o servidor inteiro)."""
+    user = need_user(request)
+    f = await form(request)
+    check_csrf(f, user)
+    row = _channel_row(int(user["id"]), clean_id(one(f, "canal")))
+    if not row:
+        return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
+    ids = [clean_id(v) for v in f.get("ids", []) if video_id_ok(clean_id(v))]
+    await asyncio.to_thread(db.save_selection, int(row["id"]), ids)
+    if ids:
+        threading.Thread(target=media.start_many, args=(ids,), daemon=True).start()
+    return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
+
+
 @app.post("/dl/all")
 async def dl_all(request: Request):
     user = need_user(request)
@@ -344,9 +415,18 @@ async def dl_all(request: Request):
     check_csrf(f, user)
     cid = clean_id(one(f, "canal"))
     qty = 50
+    row = None
     for c in db.channels_for_user(int(user["id"])):
         if c.get("channel_id") == cid:
             qty = int(c.get("max_videos", 50) or 50)
+            row = c
+    # "baixar TODOS" tambem vira a selecao: a playlist do canal passa a ter tudo
+    if row:
+        data = await asyncio.to_thread(youtube.cached_channel_videos, cid, qty)
+        await asyncio.to_thread(
+            db.save_selection, int(row["id"]),
+            [it["id"] for it in data["items"] if video_id_ok(it.get("id", ""))], True,
+        )
     threading.Thread(target=media.ensure_channel_downloads, args=(cid, qty), daemon=True).start()
     return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
 
@@ -429,6 +509,62 @@ async def lista(request: Request, u: str = "", t: str = "", modo: str = "", mode
     headers = {"Content-Type": "application/x-mpegURL; charset=utf-8"}
     if download == "1":
         headers["Content-Disposition"] = 'attachment; filename="playlist.m3u"'
+    return PlainTextResponse(body, headers=headers)
+
+
+def _safe_filename(name: str) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "canal").strip())[:48]
+    return s.strip("._-") or "canal"
+
+
+@app.get("/canal/{channel_id}.m3u8")
+@app.get("/canal/{channel_id}.m3u")
+async def canal_playlist(
+    channel_id: str,
+    request: Request,
+    u: str = "",
+    t: str = "",
+    download: str = "",
+    formato: str = "",
+    ao_vivo: str = "",
+):
+    """Playlist .m3u8 de UM canal: so os videos marcados nas caixas de selecao.
+
+    A selecao fica salva no banco, entao da para baixar o arquivo, abrir no VLC
+    ou cadastrar a URL no painel a qualquer momento depois de escolher os videos.
+
+    Acesso pelo token de playlist (u/t, como no /lista.php) ou pelo cookie de
+    sessao do painel -- assim o botao "baixar .m3u8" funciona na propria tela."""
+    owner = _playlist_owner(u, t)
+    if not owner:
+        owner = db.session_user(request.cookies.get(SESSION_COOKIE))
+    if not owner or owner["status"] != "active":
+        return PlainTextResponse("Acesso negado: token de playlist invalido ou usuario nao ativo.",
+                                 status_code=403)
+
+    channel_id = clean_id(channel_id)
+    row = _channel_row(int(owner["id"]), channel_id)
+    if not row:
+        return PlainTextResponse("Canal nao encontrado na sua conta.", status_code=404)
+
+    data = await asyncio.to_thread(
+        youtube.cached_channel_videos, channel_id, int(row.get("max_videos", 50) or 50)
+    )
+    todos = [it for it in data["items"] if video_id_ok(it.get("id", ""))]
+    escolhidos = await asyncio.to_thread(
+        db.sync_selection, int(row["id"]), [it["id"] for it in todos], bool(row.get("has_selection"))
+    )
+    por_id = {it["id"]: it for it in todos}
+    itens = [por_id[i] for i in escolhidos if i in por_id]
+
+    body = m3u.build_channel_playlist(
+        owner, base_url(request), row, itens, formato=formato,
+        ao_vivo=ao_vivo in ("1", "s", "sim", "true"),
+    )
+    headers = {"Content-Type": "application/vnd.apple.mpegurl; charset=utf-8"}
+    if download == "1":
+        nome = _safe_filename(row.get("name") or channel_id)
+        headers["Content-Disposition"] = f'attachment; filename="{nome}.m3u8"'
     return PlainTextResponse(body, headers=headers)
 
 
@@ -891,6 +1027,8 @@ async def vercheck():
         f"canais com download continuo: {db.count_downloads_enabled()}",
         f"downloads ativos            : {media.active_downloads()}",
         f"cache em disco              : {media.disk_free_mb():.0f} MB",
+        f"disco livre                 : {media.disco_livre_mb():.0f} MB"
+        + ("  (ABAIXO DO MINIMO: downloads parados!)" if media.disco_livre_mb() < media.DISCO_MINIMO_MB else ""),
         f"usuarios                    : {len(db.list_users())}",
     ]
     return PlainTextResponse("\n".join(lines) + "\n")
@@ -975,4 +1113,6 @@ async def healthz():
         "ok": True,            # ja e o nosso app e nao outro programa
         "watch": watch.running(),
         "cache_mb": round(media.disk_free_mb(), 1),
+        "disco_livre_mb": await asyncio.to_thread(media.disco_livre_mb),
+        "downloads_ativos": media.active_downloads(),
     }
