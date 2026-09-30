@@ -18,6 +18,7 @@ continuam válidos:
 | Stream IPTV (HLS) | `/stream.php/VIDEOID.m3u8` |
 | Stream IPTV (MPEG-TS) | `/stream.php/VIDEOID.ts` |
 | Stream VLC (MP4 com seek) | `/stream.php?id=VIDEOID` |
+| Playlist de um canal (.m3u8) | `/canal/CHANNELID.m3u8` |
 | Modo canal (sequência, HLS) | `/stream.php/c-CHANNELID.m3u8` |
 | Modo canal (MPEG-TS) | `/stream.php/c-CHANNELID.ts` |
 | Gerenciador de downloads | `/dl/CHANNELID` |
@@ -47,6 +48,12 @@ continuam válidos:
   verticais (que esticam no painel) e re-encodando para normalizar.
 - **Download contínuo**: baixa sozinho os uploads novos, com limite de
   downloads simultâneos.
+- **Playlist `.m3u8` por canal**: no gerenciador de downloads, o que você marca
+  nas caixas vira um arquivo por canal (`/canal/ID.m3u8`) — pronto para baixar,
+  abrir no VLC ou cadastrar como M3U no painel. A seleção fica salva (uploads
+  novos entram marcados sozinhos; o que você desmarcar continua fora).
+- **Proteção do disco**: com pouco espaço livre os downloads param sozinhos e o
+  painel ganha o botão "Liberar espaço" (apaga do cache os vídeos mais antigos).
 - **Diagnóstico** por vídeo e por canal.
 
 ---
@@ -143,6 +150,25 @@ entrada por canal** e o servidor fica passando os vídeos sem parar. Use
 O **VLC** usa `?mode=vlc`, que devolve `stream.php?id=` (MP4 com Range, então
 dá para arrastar a linha do tempo).
 
+### Playlist `.m3u8` de um canal só
+
+No gerenciador de downloads de um canal (`/dl/CHANNELID`), as caixas marcadas
+definem a **seleção** daquele canal. Com ela, há uma playlist dedicada que
+contém **só esses vídeos** (formato igual ao do painel: cada item é VOD e aponta
+para o HLS `.m3u8`):
+
+| O que | Onde |
+|---|---|
+| URL da playlist | `/canal/CHANNELID.m3u8?u=USUARIO&t=TOKEN` |
+| Baixar o arquivo | acrescente `&download=1` |
+| Painel que só aceita MPEG-TS | `&formato=ts` (ou o botão ".m3u8 em .ts") |
+| Incluir a live no topo | `&ao_vivo=1` |
+
+Pode ser aberta no VLC (Vídeos › Abrir fluxo de rede), baixada, ou cadastrada
+como M3U no painel IPTV. A seleção fica salva no banco: **uploads novos entram
+marcados** para a playlist ir crescendo, e **o que você desmarcou continua
+fora**. O botão "Baixar TODOS do canal" também marca todos na playlist.
+
 ---
 
 ## HLS: como o vídeo chega ao painel
@@ -199,6 +225,7 @@ Detalhes que importam na prática:
 | `HLS_MAX_CACHE_MB` | 6000 | teto dos segmentos guardados em disco |
 | `HLS_VOD_MAX_AGE` | 86400 | refaz o VOD segmentado depois de 24 h |
 | `MAX_CONCURRENT_DOWNLOADS` | 3 | downloads simultâneos do yt-dlp |
+| `DISCO_MINIMO_MB` | 1200 | abaixo disso os downloads param de ser disparados (protege o disco) |
 | `IPTV_WAIT_SECONDS` | 12 | quanto esperar o download quando o painel pede um vídeo que não está em cache |
 | `VLC_WAIT_SECONDS` | 20 | o mesmo, para VLC |
 | `CHANNEL_WAIT_SECONDS` | 25 | espera do primeiro vídeo no modo canal |
@@ -256,13 +283,24 @@ re-encoda com libx264. Baixe `HLS_MAX_SESSIONS`, `HLS_PRESET=ultrafast` e a
 quantidade de vídeos por canal (`Qtd. videos`) — o concat só entra no grupo maior
 de mesma resolução.
 
+**No Windows o servidor cai com `OSError: [WinError 64] ... Accept failed on a
+socket`.** Já está resolvido: o `run.py` sobe com
+`loop=app.loops:selector_loop_factory` porque o uvicorn, no Windows, escolhe o
+`ProactorEventLoop` e ele morre quando um cliente desconecta de repente (o painel
+IPTV faz isso a cada troca de canal). **Não volte `loop` para `"asyncio"`** — nem
+troque por `asyncio.set_event_loop_policy(...)`, que o uvicorn também ignora.
+
 **Imagem esticada / formato estranho no modo canal.** Vídeos verticais são
 descartados automaticamente e os demais são re-encodados para 16:9. Se persistir,
 rode `?c=CHANNELID` para ver as dimensões de cada arquivo.
 
-**Disco encheu.** O cache guarda os vídeos baixados e os segmentos HLS. Apague
-`cache/loop_*` e `cache/hls/*` a qualquer momento quando não houver transmissão
-aberta; `HLS_MAX_CACHE_MB` limita os segmentos por conta própria.
+**Disco encheu.** O cache guarda os vídeos baixados e os segmentos HLS. Antes de
+encher, o app **para de disparar downloads** (`DISCO_MINIMO_MB`, 1,2 GB) e o
+painel ganha o botão **"Liberar espaço"**, que apaga do cache os vídeos mais
+antigos. Na inicialização ele também apaga `.part` órfãos (download interrompido
+no meio). Para limpar à mão, apague `cache/loop_*` e `cache/hls/*` quando não
+houver transmissão aberta; `HLS_MAX_CACHE_MB` limita os segmentos por conta
+própria.
 
 ---
 
