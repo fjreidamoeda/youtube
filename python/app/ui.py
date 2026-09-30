@@ -122,9 +122,10 @@ def panel_page(user: dict, channels: list[dict], base: str, m3u_url: str, vlc_ur
         else:
             tipo = '<span class="tag">Canal Dinamico</span>'
             acoes = (f'<a class="btn btn-outline btn-sm" href="/grade/{esc(c["channel_id"])}">Ver Grade</a>'
-                     f'<a class="btn btn-sm" href="/dl/{esc(c["channel_id"])}">Baixar</a>'
+                     f'<a class="btn btn-sm" href="/dl/{esc(c["channel_id"])}"'
+                     f' title="Escolher e baixar os videos (MP4)">Baixar MP4</a>'
                      f'<a class="btn btn-outline btn-sm" href="/canal/{esc(c["channel_id"])}.m3u8?download=1"'
-                     f' title="Playlist .m3u8 deste canal (videos selecionados)">.m3u8</a>')
+                     f' title="Baixa SO o arquivo de lista .m3u8 (nao traz os videos)">.m3u8</a>')
             qtd = f"""<form method="post" action="/canais/qty" class="row" style="gap:6px">
               <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
               <input type="hidden" name="id" value="{int(c['id'])}">
@@ -227,7 +228,7 @@ def grid_page(user: dict, channel: dict, videos: list[dict], next_token: str, ba
   <div class="row" style="justify-content:space-between">
     <h2 style="border:0;margin:0;padding:0">{esc(channel.get('name'))}</h2>
     <div class="row">
-      <a class="btn btn-sm" href="/dl/{esc(channel['channel_id'])}">Baixar videos</a>
+      <a class="btn btn-sm" href="/dl/{esc(channel['channel_id'])}">Baixar MP4</a>
       <a class="btn btn-outline btn-sm" href="/">Voltar</a>
     </div>
   </div>
@@ -287,7 +288,11 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
     <div class="row" style="margin-bottom:12px">
       <label class="row" style="margin:0;gap:6px;cursor:pointer;font-weight:500;color:var(--text)">
         <input type="checkbox" onclick="selTodas(this.checked)" style="width:auto"> Selecionar todos</label>
-      <button class="btn">Salvar selecao e baixar ({len(videos)})</button>
+      <button class="btn" name="acao" value="baixar" title="Grava a selecao e baixa os arquivos .mp4 dos marcados">
+        Baixar MP4 dos marcados ({len(videos)})</button>
+      <button class="btn btn-outline" name="acao" value="salvar"
+              title="Grava a selecao da playlist, sem baixar nada">
+        So salvar a selecao</button>
     </div>
     <div class="table-wrap"><table>
       <tr><th style="width:28px"></th><th>Video</th><th>Status</th><th>Acoes</th></tr>
@@ -297,8 +302,8 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
   <form method="post" action="/dl/all" style="margin-top:14px">
     <input type="hidden" name="csrf" value="{esc(user['_csrf'])}">
     <input type="hidden" name="canal" value="{esc(canal_id)}">
-    <button class="btn btn-outline">Baixar TODOS do canal</button>
-    <span class="muted" style="margin-left:8px">marca tudo e baixa</span>
+    <button class="btn btn-outline">Marcar tudo e baixar todos os MP4</button>
+    <span class="muted" style="margin-left:8px">marca tudo na playlist e baixa os videos</span>
   </form>
 </div>"""
 
@@ -315,15 +320,19 @@ def dl_page(user: dict, channel: dict | None, videos: list[dict], states: dict[s
   <p class="muted">Um arquivo so com os <strong>{n_sel}</strong> video(s) marcado(s) acima.
      Cada linha aponta para o stream HLS deste servidor, entao o painel IPTV e o VLC
      abrem normal e da para pular trecho.</p>
+  <p class="muted"><strong>Atencao:</strong> estes botoes baixam <strong>somente o arquivo
+     de lista</strong> (.m3u8, um texto pequeno). Os videos em MP4 ficam no servidor e
+     precisam ser baixados pelo botao <em>Baixar MP4</em> do card 1.</p>
   <div class="row" style="margin-top:10px">
-    <a class="btn" href="{esc(m3u_url)}{tok}&amp;download=1">Baixar {esc(titulo[:28])}.m3u8</a>
+    <a class="btn" href="{esc(m3u_url)}{tok}&amp;download=1">Baixar lista .m3u8</a>
     <a class="btn btn-outline" href="{esc(m3u_url)}{tok}" target="_blank">Abrir no navegador</a>
-    <a class="btn btn-outline" href="{esc(m3u_url)}{tok}&amp;formato=ts&amp;download=1">.m3u8 em .ts</a>
+    <a class="btn btn-outline" href="{esc(m3u_url)}{tok}&amp;formato=ts&amp;download=1">Baixar lista em .ts</a>
   </div>
   <p class="muted" style="margin-top:12px">Para cadastrar no painel IPTV (M3U), use esta URL:</p>
   <div class="mono" style="background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;word-break:break-all">{esc(m3u_url)}{tok}</div>
   <p class="muted" style="margin-top:8px">Se o painel recusar .m3u8, use o link
-     <span class="mono">.m3u8 em .ts</span> ou acrescente <span class="mono">&amp;formato=ts</span> na URL.</p>
+     <span class="mono">Baixar lista em .ts</span> ou acrescente
+     <span class="mono">&amp;formato=ts</span> na URL.</p>
 </div>"""
 
     continuo = "" if is_video else f"""
