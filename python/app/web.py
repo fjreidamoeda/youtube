@@ -388,13 +388,12 @@ async def dl_start(request: Request):
 
 @app.post("/dl/select")
 async def dl_select(request: Request):
-    """'Salvar selecao e baixar': grava as caixas marcadas e baixa os videos.
+    """Grava as caixas marcadas do canal.
 
-    Salvar e baixar juntos de proposito -- o .m3u8 do canal nasce exatamente das
-    caixas marcadas, e o usuario nao precisa lembrar de salvar antes.
-
-    Os downloads vao para uma thread solta: marcar 50 videos nao pode deixar a
-    pagina esperando (e 50 yt-dlp ao mesmo tempo travaria o servidor inteiro)."""
+    O botao de 'baixar MP4' manda acao=baixar e ai os .mp4 vao para uma thread
+    solta; o de 'so salvar' nao baixa nada. Baixar pela pagina travaria ela (50
+    yt-dlp juntos derrubam o servidor), e baixar junto com a lista confundiria:
+    a lista .m3u8 e um arquivo de texto, nao traz video junto."""
     user = need_user(request)
     f = await form(request)
     check_csrf(f, user)
@@ -403,13 +402,14 @@ async def dl_select(request: Request):
         return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
     ids = [clean_id(v) for v in f.get("ids", []) if video_id_ok(clean_id(v))]
     await asyncio.to_thread(db.save_selection, int(row["id"]), ids)
-    if ids:
+    if ids and one(f, "acao", "") == "baixar":
         threading.Thread(target=media.start_many, args=(ids,), daemon=True).start()
     return RedirectResponse(request.headers.get("referer", "/"), status_code=303)
 
 
 @app.post("/dl/all")
 async def dl_all(request: Request):
+    """Marca todos os videos do canal na selecao e baixa os .mp4."""
     user = need_user(request)
     f = await form(request)
     check_csrf(f, user)
